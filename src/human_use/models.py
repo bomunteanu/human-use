@@ -114,11 +114,13 @@ class ResearchBrief(BaseModel):
     question: str
     sections: list[BriefSection]
     summary: str
+    title: str = ""
 
 
 class DoneEvent(BaseModel):
     event: Literal["done"] = "done"
     brief: ResearchBrief
+    messages: list[dict[str, object]] = Field(default_factory=list)
 
 
 SSEEvent = Annotated[

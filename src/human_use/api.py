@@ -1,17 +1,34 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette import EventSourceResponse, ServerSentEvent
+from sqlmodel.ext.asyncio.session import AsyncSession
 
-from human_use.agent import run_agent
+from human_use.agent import run_agent, run_compile
+from human_use.auth import get_optional_user
+from human_use.crud import save_messages, upsert_session
+from human_use.db import create_db_and_tables, get_session
+from human_use.db_models import User
 from human_use.models import SSEEvent, TargetingConfig
+from human_use.routers.auth import router as auth_router
+from human_use.routers.sessions import router as sessions_router
 
-app = FastAPI(title="human-use research API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await create_db_and_tables()
+    yield
+
+
+app = FastAPI(title="human-use research API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,6 +36,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
+app.include_router(sessions_router)
 
 # Keyed by (session_id, question_index)
 _pending_events: dict[tuple[str, int], asyncio.Event] = {}
@@ -52,6 +72,7 @@ def _cleanup_session(session_id: str) -> None:
 class ResearchRequest(BaseModel):
     question: str
     session_id: str
+    messages: list[dict[str, object]] = Field(default_factory=list)
 
 
 class AnswerRequest(BaseModel):
@@ -60,10 +81,17 @@ class AnswerRequest(BaseModel):
     answer: str
 
 
+class CompileRequest(BaseModel):
+    session_id: str
+    messages: list[dict[str, object]]
+
+
 @app.post("/research/stream")
 async def research_stream(
     body: ResearchRequest,
     country_codes: list[str] = Query(default=[]),
+    current_user: Annotated[User | None, Depends(get_optional_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_session)] = None,
 ) -> EventSourceResponse:
     question = body.question
     session_id = body.session_id
@@ -75,13 +103,31 @@ async def research_stream(
 
     async def generate() -> AsyncIterator[ServerSentEvent]:
         task = asyncio.create_task(
-            run_agent(question, queue, session_id=session_id, answer_awaiter=answer_awaiter, targeting=targeting)
+            run_agent(
+                question,
+                queue,
+                session_id=session_id,
+                answer_awaiter=answer_awaiter,
+                targeting=targeting,
+                prior_messages=body.messages if body.messages else None,
+            )
         )
         try:
             while True:
                 event = await queue.get()
                 if event is None:
                     break
+                # Persist session on done if authenticated
+                if event.event == "done" and current_user is not None and db is not None:
+                    session_uuid = uuid.UUID(session_id)
+                    await upsert_session(
+                        db,
+                        session_uuid,
+                        current_user.id,
+                        question[:60],
+                        brief=event.brief.model_dump(),
+                    )
+                    await save_messages(db, session_uuid, event.messages)
                 yield ServerSentEvent(
                     data=event.model_dump_json(),
                     event=event.event,
@@ -105,3 +151,28 @@ async def research_answer(body: AnswerRequest) -> dict[str, bool]:
     if ev:
         ev.set()
     return {"ok": True}
+
+
+@app.post("/research/compile")
+async def research_compile(body: CompileRequest) -> EventSourceResponse:
+    queue: asyncio.Queue[SSEEvent | None] = asyncio.Queue()
+
+    async def generate() -> AsyncIterator[ServerSentEvent]:
+        task = asyncio.create_task(run_compile(body.messages, queue))
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield ServerSentEvent(
+                    data=event.model_dump_json(),
+                    event=event.event,
+                )
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    return EventSourceResponse(generate())

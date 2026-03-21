@@ -1,3 +1,17 @@
+// ─── Anthropic conversation history types ────────────────────────────────────
+
+export type AnthropicContentBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+  | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean };
+
+export interface AnthropicMessage {
+  role: "user" | "assistant";
+  content: string | AnthropicContentBlock[];
+}
+
+// ─── SSE event types ─────────────────────────────────────────────────────────
+
 export interface ClarifyingQuestionEvent {
   event: "clarifying_question";
   session_id: string;
@@ -47,11 +61,13 @@ export interface ResearchBrief {
   question: string;
   sections: BriefSection[];
   summary: string;
+  title: string;
 }
 
 export interface DoneEvent {
   event: "done";
   brief: ResearchBrief;
+  messages: AnthropicMessage[];
 }
 
 export type SSEEvent =
@@ -110,3 +126,12 @@ export interface ClarifyingQuestion {
 }
 
 export type ChatMessage = UserMessage | AgentThought | SurveyResult | ClarifyingQuestion;
+
+// ─── Session history ──────────────────────────────────────────────────────────
+
+export interface SessionSummary {
+  id: string;
+  title: string;
+  created_at: string; // ISO 8601
+  brief: ResearchBrief | null;
+}

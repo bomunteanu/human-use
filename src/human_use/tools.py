@@ -16,7 +16,7 @@ from human_use.models import (
     TargetingConfig,
 )
 
-RESPONSES_PER_DATAPOINT = 10
+RESPONSES_PER_DATAPOINT = 50
 
 # Map common language names the LLM might produce → ISO 639-1 two-letter codes.
 # LanguageFilter validates that codes are exactly 2 characters.
@@ -67,7 +67,7 @@ async def ask_free_text(question: str, n: int, language: str | None = None, targ
 
     Use this when you need open-ended qualitative responses — opinions, descriptions,
     creative answers, or anything that cannot be captured by a fixed set of options.
-    Collect n human responses (rounded up to the nearest 10).
+    Collect n human responses (rounded up to the nearest 50).
 
     After calling this, use check_progress(order_id) to poll for completion, then
     get_results(order_id) to retrieve a FreeTextResult with all responses.
@@ -129,15 +129,16 @@ async def ask_multiple_choice(
     client = get_client()
     datapoints = [question] * _n_datapoints(n)
 
+    capped_options = options[:8]
+
     def _create() -> str:
         order = client.order.create_classification_order(
             name=f"mc::{question[:80]}",
             instruction=question,
-            answer_options=options,
-            datapoints=datapoints,
+            answer_options=capped_options,
+            datapoints=["survey"] * _n_datapoints(n),
             responses_per_datapoint=RESPONSES_PER_DATAPOINT,
             filters=_filters(language, targeting),
-            data_type="text",
         )
         order.run()
         return order.id

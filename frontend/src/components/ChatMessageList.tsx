@@ -4,18 +4,20 @@ import { UserMessageBubble } from "./UserMessageBubble";
 import { AgentThoughtBubble } from "./AgentThoughtBubble";
 import { SurveyResultCard } from "./SurveyResultCard";
 import { ClarifyingQuestionBubble } from "./ClarifyingQuestionBubble";
+import { ThinkingBubble } from "./ThinkingBubble";
 import type { ChatMessage } from "../types";
 
 interface Props {
   messages: ChatMessage[];
+  showThinking: boolean;
 }
 
-export function ChatMessageList({ messages }: Props) {
+export function ChatMessageList({ messages, showThinking }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length]);
+  }, [messages.length, showThinking]);
 
   return (
     <div className="flex-1 overflow-y-auto py-4 space-y-1">
@@ -35,6 +37,11 @@ export function ChatMessageList({ messages }: Props) {
           )}
         </AnimatedMessageWrapper>
       ))}
+      {showThinking && (
+        <AnimatedMessageWrapper>
+          <ThinkingBubble />
+        </AnimatedMessageWrapper>
+      )}
       <div ref={bottomRef} />
     </div>
   );

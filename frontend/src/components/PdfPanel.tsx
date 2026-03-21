@@ -9,17 +9,18 @@ export function PdfPanel() {
   const { state, dispatch } = useResearchContext();
   const [zoom, setZoom] = useState(1.0);
 
-  const { currentQuestion, sections, orders, chartCaptures, isDone } = state;
+  const { currentQuestion, sections, orders, chartCaptures, isDone, brief } = state;
 
   const completedOrders = [...orders.values()].filter(
     (o) => o.is_complete && chartCaptures.has(o.order_id),
   );
 
-  const filename = `${(currentQuestion || "research").slice(0, 40).replace(/\s+/g, "_")}_brief.pdf`;
+  const pdfTitle = brief?.title || currentQuestion || "Research Brief";
+  const filename = `${pdfTitle.slice(0, 40).replace(/\s+/g, "_")}_brief.pdf`;
 
   const doc = (
     <ResearchPdfDocument
-      question={currentQuestion}
+      title={pdfTitle}
       sections={sections}
       completedOrders={completedOrders}
       svgCaptures={chartCaptures}

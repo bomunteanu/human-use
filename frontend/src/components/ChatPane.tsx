@@ -4,7 +4,7 @@ import { ChatInputBar } from "./ChatInputBar";
 import { useResearchContext } from "../context/ResearchContext";
 
 export function ChatPane() {
-  const { state, startResearch, stopResearch, dispatch } = useResearchContext();
+  const { state, startResearch, stopResearch, compileFindings, dispatch } = useResearchContext();
   const [inputText, setInputText] = useState("");
   const [countryCodes, setCountryCodes] = useState<string[]>([]);
 
@@ -16,14 +16,26 @@ export function ChatPane() {
   };
 
   const handleCompileFindings = () => {
-    // Abort the stream so the agent stops dispatching more surveys,
-    // then open the PDF panel so the user sees whatever brief content exists.
+    if (state.isDone && state.sections.length > 0) {
+      // Research finished — just reopen the PDF panel
+      dispatch({ type: "OPEN_PDF_PANEL" });
+      return;
+    }
+    // Stream is running (or paused): stop it and synthesize what's collected
     stopResearch();
-    dispatch({ type: "OPEN_PDF_PANEL" });
+    compileFindings();
   };
 
   const hasOrders = state.orders.size > 0;
   const hasSections = state.sections.length > 0;
+
+  // Show a thinking bubble while the LLM is synthesising results into a brief
+  // (all surveys complete, no brief sections emitted yet, stream still active).
+  const showThinking =
+    state.isStreaming &&
+    state.orders.size > 0 &&
+    [...state.orders.values()].every((o) => o.is_complete) &&
+    !hasSections;
 
   return (
     <div className="flex flex-col flex-1 min-w-0 h-full">
@@ -58,7 +70,7 @@ export function ChatPane() {
           </div>
         </div>
       ) : (
-        <ChatMessageList messages={state.messages} />
+        <ChatMessageList messages={state.messages} showThinking={showThinking} />
       )}
 
       {/* Input bar */}

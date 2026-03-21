@@ -1,5 +1,5 @@
 """
-Tests for the SSE research endpoint and clarifying question flow.
+Tests for the SSE research endpoint, clarifying question flow, and compile endpoint.
 
 All tests mock RapidataClient and anthropic.AsyncAnthropic entirely.
 """
@@ -117,12 +117,39 @@ async def _collect_events(
     client: AsyncClient,
     question: str,
     session_id: str = "test_session",
+    messages: list[dict] | None = None,
+) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    body: dict[str, object] = {"question": question, "session_id": session_id}
+    if messages is not None:
+        body["messages"] = messages
+    async with client.stream(
+        "POST",
+        "/research/stream",
+        json=body,
+    ) as response:
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if line.startswith("data: "):
+                payload = line[6:]
+                if payload:
+                    try:
+                        events.append(json.loads(payload))
+                    except json.JSONDecodeError:
+                        pass
+    return events
+
+
+async def _collect_compile_events(
+    client: AsyncClient,
+    messages: list[dict],
+    session_id: str = "compile_session",
 ) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
     async with client.stream(
         "POST",
-        "/research/stream",
-        json={"question": question, "session_id": session_id},
+        "/research/compile",
+        json={"session_id": session_id, "messages": messages},
     ) as response:
         async for line in response.aiter_lines():
             line = line.strip()
@@ -363,6 +390,118 @@ async def test_done_event_contains_valid_research_brief(
     assert brief.summary == "Respondents are generally positive."
 
 
+async def test_done_event_includes_messages_array(
+    mock_rapidata: MagicMock,
+) -> None:
+    """done event carries a non-empty messages array for conversation history."""
+    dispatch_order = _make_order("mc::Test history?", "ord_hist")
+    mock_rapidata.order.create_classification_order.return_value = dispatch_order
+
+    result_order = _make_order("mc::Test history?", "ord_hist")
+    result_order.get_status.return_value = "Completed"
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("yes", 8), ("no", 2))
+    )
+    mock_rapidata.order.get_order_by_id.return_value = result_order
+
+    first_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "ask_multiple_choice",
+                {"question": "Test history?", "options": ["yes", "no"], "n": 10},
+                "tu_1",
+            ),
+        ]
+    )
+    second_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "Yes wins.", "sections": [{"title": "R", "content": "C."}]},
+                "tu_2",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            raw_events = await _collect_events(client, "Test history?")
+
+    done_events = [e for e in raw_events if e["event"] == "done"]
+    assert len(done_events) == 1
+
+    parsed = _parse_event(done_events[0])
+    assert isinstance(parsed, DoneEvent)
+    assert isinstance(parsed.messages, list)
+    assert len(parsed.messages) > 0
+    # First message should be the user's research question
+    assert parsed.messages[0]["role"] == "user"
+    assert "Test history?" in str(parsed.messages[0]["content"])
+
+
+async def test_prior_messages_are_prepended_to_conversation(
+    mock_rapidata: MagicMock,
+) -> None:
+    """Messages from a previous session are passed to the Anthropic API."""
+    dispatch_order = _make_order("mc::Follow-up?", "ord_fu")
+    mock_rapidata.order.create_classification_order.return_value = dispatch_order
+
+    result_order = _make_order("mc::Follow-up?", "ord_fu")
+    result_order.get_status.return_value = "Completed"
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("A", 5), ("B", 5))
+    )
+    mock_rapidata.order.get_order_by_id.return_value = result_order
+
+    received_messages: list[list[object]] = []
+
+    async def capturing_create(**kwargs: object) -> MagicMock:
+        received_messages.append(list(kwargs.get("messages", [])))
+        if len(received_messages) == 1:
+            return _claude_response(
+                content=[
+                    _tool_use_block(
+                        "ask_multiple_choice",
+                        {"question": "Follow-up?", "options": ["A", "B"], "n": 10},
+                        "tu_1",
+                    ),
+                ]
+            )
+        return _claude_response(
+            content=[
+                _tool_use_block(
+                    "complete_research",
+                    {"summary": "Tie.", "sections": [{"title": "R", "content": "C."}]},
+                    "tu_2",
+                ),
+            ]
+        )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=capturing_create)
+
+    prior = [
+        {"role": "user", "content": "Research question: Previous topic\n\nPlease research."},
+        {"role": "assistant", "content": [{"type": "text", "text": "Previous answer."}]},
+    ]
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await _collect_events(client, "Follow-up question?", messages=prior)
+
+    assert len(received_messages) >= 1
+    first_call_messages = received_messages[0]
+    # Prior messages should appear at the start
+    assert first_call_messages[0] == prior[0]
+    assert first_call_messages[1] == prior[1]
+    # New research question appended after prior messages
+    assert first_call_messages[2]["role"] == "user"
+    assert "Follow-up question?" in str(first_call_messages[2]["content"])
+
+
 async def test_order_complete_compare_has_distribution_and_winner(
     mock_rapidata: MagicMock,
 ) -> None:
@@ -470,6 +609,155 @@ async def test_event_sequence_order_is_correct(mock_rapidata: MagicMock) -> None
 
     idx_done = event_types.index("done")
     assert idx_brief < idx_done
+
+
+# ---------------------------------------------------------------------------
+# Compile endpoint tests
+# ---------------------------------------------------------------------------
+
+
+async def test_compile_endpoint_emits_brief_and_done() -> None:
+    """POST /research/compile streams brief_update and done events."""
+    compile_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {
+                    "summary": "Synthesized findings.",
+                    "sections": [
+                        {"title": "Key Insights", "content": "People prefer option A."},
+                        {"title": "Demographics", "content": "Mainly 18-35 age group."},
+                    ],
+                },
+                "tu_compile",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=compile_response)
+
+    prior_messages = [
+        {"role": "user", "content": "Research question: Which option do people prefer?\n\nPlease research."},
+        {"role": "assistant", "content": [{"type": "text", "text": "I will survey people."}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ord_1"}]},
+    ]
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_compile_events(client, prior_messages)
+
+    event_types = [e["event"] for e in events]
+    assert "brief_update" in event_types
+    assert "done" in event_types
+    assert event_types.index("brief_update") < event_types.index("done")
+
+
+async def test_compile_endpoint_produces_correct_brief_content() -> None:
+    """Compile endpoint synthesizes all messages into a well-structured brief."""
+    compile_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {
+                    "summary": "Users strongly prefer dark mode.",
+                    "sections": [
+                        {"title": "Preference", "content": "80% prefer dark mode."},
+                        {"title": "Reasons", "content": "Eye strain cited by 60%."},
+                    ],
+                },
+                "tu_c",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=compile_response)
+
+    messages = [
+        {"role": "user", "content": "Research question: Dark vs light mode?\n\nPlease research."},
+        {"role": "assistant", "content": [{"type": "text", "text": "Dispatching survey."}]},
+    ]
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_compile_events(client, messages)
+
+    done_events = [e for e in events if e["event"] == "done"]
+    assert len(done_events) == 1
+
+    parsed = _parse_event(done_events[0])
+    assert isinstance(parsed, DoneEvent)
+    brief = parsed.brief
+    assert isinstance(brief, ResearchBrief)
+    assert brief.summary == "Users strongly prefer dark mode."
+    assert len(brief.sections) == 2
+    assert brief.sections[0].title == "Preference"
+    assert brief.sections[1].title == "Reasons"
+
+
+async def test_compile_receives_full_conversation_history() -> None:
+    """Compile passes all provided messages directly to the Anthropic API."""
+    received_messages: list[list[object]] = []
+
+    async def capturing_create(**kwargs: object) -> MagicMock:
+        received_messages.append(list(kwargs.get("messages", [])))
+        return _claude_response(
+            content=[
+                _tool_use_block(
+                    "complete_research",
+                    {"summary": "Done.", "sections": [{"title": "R", "content": "C."}]},
+                    "tu_c",
+                ),
+            ]
+        )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=capturing_create)
+
+    input_messages = [
+        {"role": "user", "content": "Research question: Topic A\n\nPlease research."},
+        {"role": "assistant", "content": [{"type": "text", "text": "Thought 1."}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "result1"}]},
+    ]
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await _collect_compile_events(client, input_messages)
+
+    assert len(received_messages) == 1
+    assert len(received_messages[0]) == len(input_messages)
+    assert received_messages[0][0] == input_messages[0]
+
+
+async def test_compile_extracts_question_from_first_user_message() -> None:
+    """Compile brief question is extracted from the first user message."""
+    compile_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "Done.", "sections": [{"title": "R", "content": "C."}]},
+                "tu_c",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=compile_response)
+
+    messages = [
+        {"role": "user", "content": "Research question: Brand awareness study\n\nPlease research."},
+    ]
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_compile_events(client, messages)
+
+    done_events = [e for e in events if e["event"] == "done"]
+    assert len(done_events) == 1
+    parsed = _parse_event(done_events[0])
+    assert isinstance(parsed, DoneEvent)
+    assert parsed.brief.question == "Brand awareness study"
 
 
 # ---------------------------------------------------------------------------
@@ -736,3 +1024,107 @@ async def test_clarifying_question_options_include_other(
     assert len(options) == 4
     assert options[:3] == ["Price", "Quality", "Speed"]
     assert options[3] == "Other (please specify)"
+
+
+# ---------------------------------------------------------------------------
+# Session persistence tests (use conftest.py fixtures: db_session, client)
+# ---------------------------------------------------------------------------
+
+
+def _complete_research_mock():
+    """Return a mock Anthropic client that immediately calls complete_research."""
+    mock_client = MagicMock()
+    response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {
+                    "summary": "Summary.",
+                    "sections": [{"title": "Section", "content": "Content."}],
+                },
+                "tu_cr_persist",
+            ),
+        ]
+    )
+    mock_client.messages.create = AsyncMock(return_value=response)
+    return mock_client
+
+
+async def _stream_with_auth(client, question: str, session_id: str, token: str | None) -> list[dict]:
+    """Stream /research/stream and collect all events, optionally with auth."""
+    events: list[dict] = []
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    async with client.stream(
+        "POST",
+        "/research/stream",
+        json={"question": question, "session_id": session_id},
+        headers=headers,
+    ) as response:
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if line.startswith("data: "):
+                payload = line[6:]
+                if payload:
+                    try:
+                        events.append(json.loads(payload))
+                    except json.JSONDecodeError:
+                        pass
+    return events
+
+
+async def test_session_persisted_on_done_when_authenticated(
+    client,
+    db_session,
+    mock_rapidata,
+):
+    """Session + messages are written to DB when done fires with valid JWT."""
+    # Register user and get token
+    res = await client.post(
+        "/auth/register", json={"email": "persist@test.com", "password": "password1"}
+    )
+    token = res.json()["access_token"]
+    question = "What do people prefer?"
+    session_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=_complete_research_mock()):
+        events = await _stream_with_auth(client, question, session_id, token)
+
+    done_events = [e for e in events if e.get("event") == "done"]
+    assert len(done_events) == 1
+
+    from human_use.crud import get_sessions, get_user_by_email
+    import uuid
+    user = await get_user_by_email(db_session, "persist@test.com")
+    assert user is not None
+    sessions = await get_sessions(db_session, user.id)
+    assert len(sessions) == 1
+    assert sessions[0].title == question[:60]
+    assert str(sessions[0].id) == session_id
+
+
+async def test_session_not_persisted_without_auth(
+    client,
+    db_session,
+    mock_rapidata,
+):
+    """No DB write when /research/stream is called without a JWT."""
+    # Register so we can verify no session was created for ANY user
+    res = await client.post(
+        "/auth/register", json={"email": "noauth@test.com", "password": "password1"}
+    )
+    token = res.json()["access_token"]
+
+    question = "Unauthenticated question"
+    session_id = "660e8400-e29b-41d4-a716-446655440001"
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=_complete_research_mock()):
+        events = await _stream_with_auth(client, question, session_id, token=None)
+
+    done_events = [e for e in events if e.get("event") == "done"]
+    assert len(done_events) == 1
+
+    from human_use.crud import get_sessions, get_user_by_email
+    user = await get_user_by_email(db_session, "noauth@test.com")
+    assert user is not None
+    sessions = await get_sessions(db_session, user.id)
+    assert len(sessions) == 0

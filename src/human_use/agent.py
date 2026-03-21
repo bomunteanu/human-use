@@ -72,9 +72,13 @@ _DISPATCH_TOOLS: list[anthropic.types.ToolParam] = [
             "type": "object",
             "properties": {
                 "question": {"type": "string"},
-                "options": {"type": "array", "items": {"type": "string"}},
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Answer options. Maximum 8; use compare or rank for more choices.",
+                    "maxItems": 8,
+                },
                 "n": {"type": "integer"},
-                "language": {"type": "string"},
             },
             "required": ["question", "options", "n"],
         },
@@ -92,7 +96,6 @@ _DISPATCH_TOOLS: list[anthropic.types.ToolParam] = [
                 "option_a": {"type": "string"},
                 "option_b": {"type": "string"},
                 "n": {"type": "integer"},
-                "language": {"type": "string"},
             },
             "required": ["question", "option_a", "option_b", "n"],
         },
@@ -109,7 +112,6 @@ _DISPATCH_TOOLS: list[anthropic.types.ToolParam] = [
                 "question": {"type": "string"},
                 "items": {"type": "array", "items": {"type": "string"}},
                 "n": {"type": "integer"},
-                "language": {"type": "string"},
             },
             "required": ["question", "items", "n"],
         },
@@ -123,9 +125,16 @@ _DISPATCH_TOOLS: list[anthropic.types.ToolParam] = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Concise, descriptive title for the research brief (5–10 words).",
+                },
                 "summary": {
                     "type": "string",
-                    "description": "High-level summary of findings",
+                    "description": (
+                        "A 2–4 sentence plain-language summary of the key findings "
+                        "suitable for display directly in the chat as a conclusion."
+                    ),
                 },
                 "sections": {
                     "type": "array",
@@ -140,9 +149,13 @@ _DISPATCH_TOOLS: list[anthropic.types.ToolParam] = [
                     "description": "Detailed sections of the research brief",
                 },
             },
-            "required": ["summary", "sections"],
+            "required": ["title", "summary", "sections"],
         },
     },
+]
+
+_COMPILE_TOOL: list[anthropic.types.ToolParam] = [
+    t for t in _DISPATCH_TOOLS if t["name"] == "complete_research"
 ]
 
 _SURVEY_TOOL_NAMES = {"ask_multiple_choice", "compare", "rank"}
@@ -154,13 +167,10 @@ class _AskClarifyingQuestionInput(TypedDict):
     options: list[str]
 
 
-
-
 class _AskMultipleChoiceInput(TypedDict):
     question: str
     options: list[str]
     n: int
-    language: NotRequired[str | None]
 
 
 class _CompareInput(TypedDict):
@@ -168,14 +178,12 @@ class _CompareInput(TypedDict):
     option_a: str
     option_b: str
     n: int
-    language: NotRequired[str | None]
 
 
 class _RankInput(TypedDict):
     question: str
     items: list[str]
     n: int
-    language: NotRequired[str | None]
 
 
 class _BriefSectionInput(TypedDict):
@@ -184,6 +192,7 @@ class _BriefSectionInput(TypedDict):
 
 
 class _CompleteResearchInput(TypedDict):
+    title: NotRequired[str]
     summary: str
     sections: list[_BriefSectionInput]
 
@@ -195,7 +204,6 @@ async def _dispatch(tool_name: str, raw_input: object, targeting: TargetingConfi
             question=inp2["question"],
             options=inp2["options"],
             n=inp2["n"],
-            language=inp2.get("language"),
             targeting=targeting,
         )
     if tool_name == "compare":
@@ -205,7 +213,6 @@ async def _dispatch(tool_name: str, raw_input: object, targeting: TargetingConfi
             option_a=inp3["option_a"],
             option_b=inp3["option_b"],
             n=inp3["n"],
-            language=inp3.get("language"),
             targeting=targeting,
         )
     if tool_name == "rank":
@@ -214,10 +221,27 @@ async def _dispatch(tool_name: str, raw_input: object, targeting: TargetingConfi
             question=inp4["question"],
             items=inp4["items"],
             n=inp4["n"],
-            language=inp4.get("language"),
             targeting=targeting,
         )
     raise ValueError(f"Unknown dispatch tool: {tool_name!r}")
+
+
+def _serialize_response_content(content: list[object]) -> list[dict[str, object]]:
+    """Convert Anthropic SDK content blocks to plain serializable dicts."""
+    result: list[dict[str, object]] = []
+    for block in content:
+        if hasattr(block, "type"):
+            block_type = block.type  # type: ignore[union-attr]
+            if block_type == "text":
+                result.append({"type": "text", "text": block.text})  # type: ignore[union-attr]
+            elif block_type == "tool_use":
+                result.append({
+                    "type": "tool_use",
+                    "id": block.id,  # type: ignore[union-attr]
+                    "name": block.name,  # type: ignore[union-attr]
+                    "input": dict(block.input),  # type: ignore[union-attr]
+                })
+    return result
 
 
 async def run_agent(
@@ -227,9 +251,13 @@ async def run_agent(
     answer_awaiter: Callable[[int], Awaitable[str]],
     poll_interval: float = POLL_INTERVAL,
     targeting: TargetingConfig | None = None,
+    prior_messages: list[dict[str, object]] | None = None,
 ) -> None:
     try:
-        await _run_agent_inner(question, queue, session_id, answer_awaiter, poll_interval, targeting)
+        await _run_agent_inner(
+            question, queue, session_id, answer_awaiter, poll_interval, targeting,
+            prior_messages=prior_messages,
+        )
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -241,6 +269,7 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "You are a research agent. Given a research question, you use human intelligence tools "
     "to gather data from real people, then synthesize the findings into a research brief. "
     "Be thorough but efficient.\n\n"
+    "{continuation_note}"
     "STEP 1 — CLARIFY: Before dispatching any surveys, ask at most {max_clarifications} "
     "clarifying questions using ask_clarifying_question to better understand the research "
     "goal. You have {remaining_clarifications} clarifying questions remaining. "
@@ -251,7 +280,28 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "When you have {soft_cap} or fewer surveys left, prefer calling complete_research "
     "with the data you have rather than dispatching more surveys.\n\n"
     "STEP 3 — BRIEF: Call complete_research with a structured brief once you have "
-    "gathered sufficient data."
+    "gathered sufficient data. {brief_scope_note}"
+)
+
+_CONTINUATION_NOTE = (
+    "IMPORTANT — CONTINUATION MODE: The conversation history already contains one or more "
+    "prior research sessions with survey data already collected. You are adding to that body "
+    "of research, not replacing it.\n\n"
+)
+
+_BRIEF_SCOPE_NOTE_CONTINUATION = (
+    "Your brief MUST synthesize findings from ALL prior sessions AND any new data collected "
+    "in this session — not just the current question."
+)
+
+_BRIEF_SCOPE_NOTE_FRESH = ""
+
+_COMPILE_SYSTEM_PROMPT = (
+    "You are a research synthesis agent. You have the full conversation history from one or more "
+    "research sessions, including all survey questions, human responses, and data collected. "
+    "Your task is to synthesize all findings into a comprehensive, structured research brief. "
+    "Do NOT dispatch any new surveys or ask any questions. "
+    "Call complete_research with a thorough, well-organized brief that captures all key insights."
 )
 
 
@@ -262,26 +312,33 @@ async def _run_agent_inner(
     answer_awaiter: Callable[[int], Awaitable[str]],
     poll_interval: float,
     targeting: TargetingConfig | None = None,
+    prior_messages: list[dict[str, object]] | None = None,
 ) -> None:
     client = anthropic.AsyncAnthropic()
     surveys_dispatched: int = 0
     clarifications_dispatched: int = 0
 
-    messages: list[anthropic.types.MessageParam] = [
-        {
-            "role": "user",
-            "content": (
-                f"Research question: {question}\n\n"
-                "First ask any clarifying questions you need, then gather human intelligence "
-                "using the survey tools, then call complete_research with your findings."
-            ),
-        }
-    ]
+    initial_content = (
+        f"Research question: {question}\n\n"
+        "First ask any clarifying questions you need, then gather human intelligence "
+        "using the survey tools, then call complete_research with your findings."
+    )
+
+    # messages: for Anthropic API (may contain SDK objects)
+    messages: list[anthropic.types.MessageParam] = list(prior_messages or [])  # type: ignore[arg-type]
+    messages.append({"role": "user", "content": initial_content})
+
+    # serializable_messages: plain dicts to send back to the frontend
+    serializable_messages: list[dict[str, object]] = list(prior_messages or [])
+    serializable_messages.append({"role": "user", "content": initial_content})
 
     while True:
         remaining_surveys = MAX_SURVEYS - surveys_dispatched
         remaining_clarifications = MAX_CLARIFICATIONS - clarifications_dispatched
+        is_continuation = bool(prior_messages)
         system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+            continuation_note=_CONTINUATION_NOTE if is_continuation else "",
+            brief_scope_note=_BRIEF_SCOPE_NOTE_CONTINUATION if is_continuation else _BRIEF_SCOPE_NOTE_FRESH,
             max_clarifications=MAX_CLARIFICATIONS,
             remaining_clarifications=remaining_clarifications,
             max_surveys=MAX_SURVEYS,
@@ -306,6 +363,9 @@ async def _run_agent_inner(
                 "content": response.content,  # type: ignore[arg-type]
             }
         )
+        serializable_messages.append(
+            {"role": "assistant", "content": _serialize_response_content(response.content)}
+        )
 
         if response.stop_reason == "end_turn":
             full_text = " ".join(
@@ -318,7 +378,7 @@ async def _run_agent_inner(
                 sections=[BriefSection(title="Summary", content=full_text)],
                 summary=full_text[:500],
             )
-            await queue.put(DoneEvent(brief=brief))
+            await queue.put(DoneEvent(brief=brief, messages=serializable_messages))
             await queue.put(None)
             return
 
@@ -337,12 +397,30 @@ async def _run_agent_inner(
                 sections = [BriefSection(**s) for s in inp["sections"]]
                 brief = ResearchBrief(
                     question=question,
+                    title=inp.get("title") or question,
                     sections=sections,
                     summary=inp["summary"],
                 )
+                # Close the conversation: the Anthropic API requires that every
+                # tool_use block is immediately followed by a tool_result in the
+                # next user message.  We return here without the normal
+                # tool_results loop, so we must add synthetic results for every
+                # tool_use in this response before persisting serializable_messages.
+                closing_results: list[dict[str, object]] = [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": b.id,
+                        "content": "Research complete.",
+                    }
+                    for b in response.content
+                    if b.type == "tool_use"
+                ]
+                serializable_messages.append({"role": "user", "content": closing_results})
+                # Emit summary as a chat bubble before the PDF sections
+                await queue.put(AgentThoughtEvent(text=inp["summary"]))
                 for section in sections:
                     await queue.put(BriefUpdateEvent(section=section))
-                await queue.put(DoneEvent(brief=brief))
+                await queue.put(DoneEvent(brief=brief, messages=serializable_messages))
                 await queue.put(None)
                 return
 
@@ -470,3 +548,69 @@ async def _run_agent_inner(
             )
 
         messages.append({"role": "user", "content": tool_results})
+        serializable_messages.append({"role": "user", "content": list(tool_results)})
+
+
+async def run_compile(
+    messages: list[dict[str, object]],
+    queue: asyncio.Queue[SSEEvent | None],
+) -> None:
+    try:
+        await _run_compile_inner(messages, queue)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        await queue.put(None)
+        raise exc
+
+
+async def _run_compile_inner(
+    messages: list[dict[str, object]],
+    queue: asyncio.Queue[SSEEvent | None],
+) -> None:
+    client = anthropic.AsyncAnthropic()
+
+    # Extract the original research question from the first user message for the brief title
+    question = "Research Brief"
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str) and "Research question:" in content:
+                for line in content.splitlines():
+                    if line.startswith("Research question:"):
+                        question = line[len("Research question:"):].strip()
+                        break
+            break
+
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        system=_COMPILE_SYSTEM_PROMPT,
+        tools=_COMPILE_TOOL,
+        messages=messages,  # type: ignore[arg-type]
+        tool_choice={"type": "tool", "name": "complete_research"},
+    )
+
+    for block in response.content:
+        if block.type == "text" and block.text:
+            await queue.put(AgentThoughtEvent(text=block.text))
+
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "complete_research":
+            inp = cast(_CompleteResearchInput, block.input)
+            sections = [BriefSection(**s) for s in inp["sections"]]
+            brief = ResearchBrief(
+                question=question,
+                title=inp.get("title") or question,
+                sections=sections,
+                summary=inp["summary"],
+            )
+            await queue.put(AgentThoughtEvent(text=inp["summary"]))
+            for section in sections:
+                await queue.put(BriefUpdateEvent(section=section))
+            await queue.put(DoneEvent(brief=brief, messages=list(messages)))
+            await queue.put(None)
+            return
+
+    # Fallback: tool_choice should prevent reaching here, but handle gracefully
+    await queue.put(None)
