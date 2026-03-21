@@ -1,5 +1,11 @@
 import { useCallback, useRef, useState } from "react";
-import type { AgentThoughtEvent, BriefSection, OrderState, SSEEvent } from "../types";
+import type {
+  AgentThoughtEvent,
+  BriefSection,
+  ClarifyingQuestionEvent,
+  OrderState,
+  SSEEvent,
+} from "../types";
 
 interface StreamState {
   thoughts: AgentThoughtEvent[];
@@ -8,12 +14,15 @@ interface StreamState {
   isDone: boolean;
   isStreaming: boolean;
   error: string | null;
+  clarifyingQuestion: ClarifyingQuestionEvent | null;
 }
 
 function applyEvent(prev: StreamState, evt: SSEEvent): StreamState {
   const next = { ...prev };
 
-  if (evt.event === "agent_thought") {
+  if (evt.event === "clarifying_question") {
+    next.clarifyingQuestion = evt;
+  } else if (evt.event === "agent_thought") {
     next.thoughts = [...prev.thoughts, evt];
   } else if (evt.event === "order_dispatched") {
     const orders = new Map(prev.orders);
@@ -78,37 +87,44 @@ function* parseSSEChunk(chunk: string): Generator<SSEEvent> {
   }
 }
 
-export function useResearchStream() {
-  const [state, setState] = useState<StreamState>({
-    thoughts: [],
-    orders: new Map(),
-    sections: [],
-    isDone: false,
-    isStreaming: false,
-    error: null,
-  });
-  const abortRef = useRef<AbortController | null>(null);
+const INITIAL_STATE: StreamState = {
+  thoughts: [],
+  orders: new Map(),
+  sections: [],
+  isDone: false,
+  isStreaming: false,
+  error: null,
+  clarifyingQuestion: null,
+};
 
-  const start = useCallback((question: string) => {
+export function useResearchStream() {
+  const [state, setState] = useState<StreamState>(INITIAL_STATE);
+  const abortRef = useRef<AbortController | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
+
+  const start = useCallback((question: string, countryCodes: string[] = []) => {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
+    const sessionId = crypto.randomUUID();
+    sessionIdRef.current = sessionId;
+
     setState({
-      thoughts: [],
-      orders: new Map(),
-      sections: [],
-      isDone: false,
+      ...INITIAL_STATE,
       isStreaming: true,
-      error: null,
     });
 
     (async () => {
       try {
-        const res = await fetch("http://localhost:8000/research/stream", {
+        const url = new URL("http://localhost:8000/research/stream");
+        for (const code of countryCodes) {
+          url.searchParams.append("country_codes", code);
+        }
+        const res = await fetch(url.toString(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question }),
+          body: JSON.stringify({ question, session_id: sessionId }),
           signal: controller.signal,
         });
 
@@ -161,5 +177,23 @@ export function useResearchStream() {
     setState((prev) => ({ ...prev, isStreaming: false }));
   }, []);
 
-  return { state, start, stop };
+  const submitAnswer = useCallback((questionIndex: number, answer: string) => {
+    const sessionId = sessionIdRef.current;
+    if (!sessionId) return;
+
+    // Immediately clear the question from UI
+    setState((prev) => ({ ...prev, clarifyingQuestion: null }));
+
+    fetch("http://localhost:8000/research/answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        question_index: questionIndex,
+        answer,
+      }),
+    });
+  }, []);
+
+  return { state, start, stop, submitAnswer };
 }

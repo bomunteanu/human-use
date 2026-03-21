@@ -1,3 +1,11 @@
+export interface ClarifyingQuestionEvent {
+  event: "clarifying_question";
+  session_id: string;
+  question_index: number;
+  question: string;
+  options: string[];  // always 4 items
+}
+
 export interface AgentThoughtEvent {
   event: "agent_thought";
   text: string;
@@ -47,6 +55,7 @@ export interface DoneEvent {
 }
 
 export type SSEEvent =
+  | ClarifyingQuestionEvent
   | AgentThoughtEvent
   | OrderDispatchedEvent
   | OrderProgressEvent
@@ -64,3 +73,40 @@ export interface OrderState {
   winner: string | null;
   n_responses: number | null;
 }
+
+// ─── Chat message union ───────────────────────────────────────────────────────
+
+export interface UserMessage {
+  id: string;
+  type: "user_message";
+  text: string;
+  timestamp: number;
+}
+
+export interface AgentThought {
+  id: string;
+  type: "agent_thought";
+  text: string; // raw markdown
+  timestamp: number;
+}
+
+export interface SurveyResult {
+  id: string;
+  type: "survey_result";
+  order: OrderState; // full snapshot at order_complete
+  chartCapture: string | null; // null until SVG captured
+  timestamp: number;
+}
+
+export interface ClarifyingQuestion {
+  id: string;
+  type: "clarifying_question";
+  sessionId: string;
+  questionIndex: number;
+  question: string;
+  options: string[]; // always 4
+  answeredWith: string | null; // null = pending; string = user's answer
+  timestamp: number;
+}
+
+export type ChatMessage = UserMessage | AgentThought | SurveyResult | ClarifyingQuestion;

@@ -5,6 +5,12 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field
 
 
+class TargetingConfig(BaseModel):
+    """Geographic targeting for Rapidata orders. Empty country_codes means Worldwide."""
+
+    country_codes: list[str]  # ISO 3166-1 alpha-2 codes; empty = no filter
+
+
 class FreeTextResult(BaseModel):
     order_id: str
     order_type: Literal["free_text"] = "free_text"
@@ -59,6 +65,14 @@ Result = FreeTextResult | MultipleChoiceResult | CompareResult | RankResult
 # ---------------------------------------------------------------------------
 
 
+class ClarifyingQuestionEvent(BaseModel):
+    event: Literal["clarifying_question"] = "clarifying_question"
+    session_id: str
+    question_index: int
+    question: str
+    options: list[str]  # always 4 items: 3 provided + "Other (please specify)"
+
+
 class AgentThoughtEvent(BaseModel):
     event: Literal["agent_thought"] = "agent_thought"
     text: str
@@ -108,7 +122,8 @@ class DoneEvent(BaseModel):
 
 
 SSEEvent = Annotated[
-    AgentThoughtEvent
+    ClarifyingQuestionEvent
+    | AgentThoughtEvent
     | OrderDispatchedEvent
     | OrderProgressEvent
     | OrderCompleteEvent

@@ -1,7 +1,7 @@
 from mcp.server.fastmcp import FastMCP
 
 from human_use.tools import (
-    ask_free_text,
+    ask_clarifying_question,
     ask_multiple_choice,
     check_progress,
     compare,
@@ -11,7 +11,7 @@ from human_use.tools import (
 
 mcp = FastMCP(name="human-use")
 
-mcp.tool()(ask_free_text)
+mcp.tool()(ask_clarifying_question)
 mcp.tool()(ask_multiple_choice)
 mcp.tool()(compare)
 mcp.tool()(rank)

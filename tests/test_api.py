@@ -1,16 +1,12 @@
 """
-Tests for the SSE research endpoint.
+Tests for the SSE research endpoint and clarifying question flow.
 
 All tests mock RapidataClient and anthropic.AsyncAnthropic entirely.
-Each test verifies:
-  - The endpoint emits the correct event sequence
-  - Each event deserializes into the correct typed model
-  - order_complete events contain distribution, winner, n_responses
-  - done event contains a valid ResearchBrief
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +20,7 @@ from human_use.api import app
 from human_use.models import (
     AgentThoughtEvent,
     BriefUpdateEvent,
+    ClarifyingQuestionEvent,
     DoneEvent,
     OrderCompleteEvent,
     OrderDispatchedEvent,
@@ -45,6 +42,16 @@ def reset_client():
     client_module._client = None
     yield
     client_module._client = None
+
+
+@pytest.fixture(autouse=True)
+def reset_pending():
+    import human_use.api as api_module
+    api_module._pending_events.clear()
+    api_module._pending_answers.clear()
+    yield
+    api_module._pending_events.clear()
+    api_module._pending_answers.clear()
 
 
 @pytest.fixture
@@ -99,9 +106,24 @@ def _claude_response(
     return response
 
 
-async def _collect_events(client: AsyncClient, url: str) -> list[dict[str, object]]:
+def _mc_df(*options_and_counts: tuple[str, int]) -> pd.DataFrame:
+    """Build a DataFrame with aggregatedResults_<option> columns as get_results expects."""
+    return pd.DataFrame(
+        {f"aggregatedResults_{opt}": [count] for opt, count in options_and_counts}
+    )
+
+
+async def _collect_events(
+    client: AsyncClient,
+    question: str,
+    session_id: str = "test_session",
+) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
-    async with client.stream("GET", url) as response:
+    async with client.stream(
+        "POST",
+        "/research/stream",
+        json={"question": question, "session_id": session_id},
+    ) as response:
         async for line in response.aiter_lines():
             line = line.strip()
             if line.startswith("data: "):
@@ -119,55 +141,40 @@ def _parse_event(data: dict[str, object]) -> SSEEvent:
 
 
 # ---------------------------------------------------------------------------
-# Full flow test: multiple-choice dispatch → complete_research
+# Full flow tests
 # ---------------------------------------------------------------------------
 
 
 async def test_sse_endpoint_emits_correct_event_sequence(
     mock_rapidata: MagicMock,
 ) -> None:
-    # Rapidata: create order
     dispatch_order = _make_order("mc::Which do you prefer?", "ord_mc_1")
     mock_rapidata.order.create_classification_order.return_value = dispatch_order
 
-    # Rapidata: check_progress and get_results share the same get_order_by_id return
     result_order = _make_order("mc::Which do you prefer?", "ord_mc_1")
     result_order.get_status.return_value = "Completed"
-    df = pd.DataFrame({"answer": ["A", "B", "A", "A", "B", "A", "A", "B", "A", "A"]})
-    raw_results = MagicMock()
-    raw_results.to_pandas.return_value = df
-    result_order.get_results.return_value = raw_results
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("A", 7), ("B", 3))
+    )
     mock_rapidata.order.get_order_by_id.return_value = result_order
 
-    # Anthropic: first response dispatches ask_multiple_choice
     first_response = _claude_response(
         content=[
             _text_block("I will survey humans about their preference."),
             _tool_use_block(
                 name="ask_multiple_choice",
-                tool_input={
-                    "question": "Which do you prefer?",
-                    "options": ["A", "B"],
-                    "n": 10,
-                },
+                tool_input={"question": "Which do you prefer?", "options": ["A", "B"], "n": 10},
                 tool_id="tu_1",
             ),
         ]
     )
-
-    # Anthropic: second response finishes with complete_research
     second_response = _claude_response(
         content=[
             _tool_use_block(
                 name="complete_research",
                 tool_input={
                     "summary": "Humans strongly prefer A over B.",
-                    "sections": [
-                        {
-                            "title": "Preference Results",
-                            "content": "A received 7/10 votes; B received 3/10.",
-                        }
-                    ],
+                    "sections": [{"title": "Preference Results", "content": "A: 7, B: 3."}],
                 },
                 tool_id="tu_2",
             ),
@@ -175,18 +182,11 @@ async def test_sse_endpoint_emits_correct_event_sequence(
     )
 
     mock_client = MagicMock()
-    mock_client.messages.create = AsyncMock(
-        side_effect=[first_response, second_response]
-    )
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
 
     with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            events = await _collect_events(
-                client,
-                "/research/stream?question=Which+do+you+prefer%3F",
-            )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_events(client, "Which do you prefer?")
 
     event_types = [e["event"] for e in events]
     assert "agent_thought" in event_types
@@ -205,10 +205,9 @@ async def test_each_event_deserializes_into_correct_typed_model(
 
     result_order = _make_order("mc::Test Q", "ord_1")
     result_order.get_status.return_value = "Completed"
-    df = pd.DataFrame({"answer": ["X", "Y", "X", "X"]})
-    raw = MagicMock()
-    raw.to_pandas.return_value = df
-    result_order.get_results.return_value = raw
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("X", 3), ("Y", 1))
+    )
     mock_rapidata.order.get_order_by_id.return_value = result_order
 
     first_response = _claude_response(
@@ -225,25 +224,18 @@ async def test_each_event_deserializes_into_correct_typed_model(
         content=[
             _tool_use_block(
                 "complete_research",
-                {
-                    "summary": "X wins.",
-                    "sections": [{"title": "Result", "content": "X got 3, Y got 1."}],
-                },
+                {"summary": "X wins.", "sections": [{"title": "Result", "content": "X: 3, Y: 1."}]},
                 "tu_2",
             ),
         ]
     )
 
     mock_client = MagicMock()
-    mock_client.messages.create = AsyncMock(
-        side_effect=[first_response, second_response]
-    )
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
 
     with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            raw_events = await _collect_events(client, "/research/stream?question=Test+Q")
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            raw_events = await _collect_events(client, "Test Q")
 
     type_map = {
         "agent_thought": AgentThoughtEvent,
@@ -257,10 +249,7 @@ async def test_each_event_deserializes_into_correct_typed_model(
     for raw in raw_events:
         parsed = _parse_event(raw)
         expected_cls = type_map[str(raw["event"])]
-        assert isinstance(parsed, expected_cls), (
-            f"Expected {expected_cls.__name__} for event={raw['event']!r}, "
-            f"got {type(parsed).__name__}"
-        )
+        assert isinstance(parsed, expected_cls)
 
 
 async def test_order_complete_event_contains_distribution_winner_n_responses(
@@ -271,37 +260,16 @@ async def test_order_complete_event_contains_distribution_winner_n_responses(
 
     result_order = _make_order("mc::Favorite color?", "ord_color")
     result_order.get_status.return_value = "Completed"
-    # 6 red, 3 blue, 1 green
-    df = pd.DataFrame(
-        {
-            "answer": [
-                "red",
-                "red",
-                "red",
-                "red",
-                "red",
-                "red",
-                "blue",
-                "blue",
-                "blue",
-                "green",
-            ]
-        }
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("red", 6), ("blue", 3), ("green", 1))
     )
-    raw = MagicMock()
-    raw.to_pandas.return_value = df
-    result_order.get_results.return_value = raw
     mock_rapidata.order.get_order_by_id.return_value = result_order
 
     first_response = _claude_response(
         content=[
             _tool_use_block(
                 "ask_multiple_choice",
-                {
-                    "question": "Favorite color?",
-                    "options": ["red", "blue", "green"],
-                    "n": 10,
-                },
+                {"question": "Favorite color?", "options": ["red", "blue", "green"], "n": 10},
                 "tu_1",
             ),
         ]
@@ -312,9 +280,7 @@ async def test_order_complete_event_contains_distribution_winner_n_responses(
                 "complete_research",
                 {
                     "summary": "Red is the favorite.",
-                    "sections": [
-                        {"title": "Colors", "content": "Red dominated with 6/10."}
-                    ],
+                    "sections": [{"title": "Colors", "content": "Red: 6/10."}],
                 },
                 "tu_2",
             ),
@@ -322,27 +288,18 @@ async def test_order_complete_event_contains_distribution_winner_n_responses(
     )
 
     mock_client = MagicMock()
-    mock_client.messages.create = AsyncMock(
-        side_effect=[first_response, second_response]
-    )
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
 
     with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            raw_events = await _collect_events(
-                client, "/research/stream?question=Favorite+color%3F"
-            )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            raw_events = await _collect_events(client, "Favorite color?")
 
     complete_events = [e for e in raw_events if e["event"] == "order_complete"]
     assert len(complete_events) == 1
 
     parsed = _parse_event(complete_events[0])
     assert isinstance(parsed, OrderCompleteEvent)
-    assert parsed.distribution is not None
-    assert parsed.distribution["red"] == 6
-    assert parsed.distribution["blue"] == 3
-    assert parsed.distribution["green"] == 1
+    assert parsed.distribution == {"red": 6, "blue": 3, "green": 1}
     assert parsed.winner == "red"
     assert parsed.n_responses == 10
 
@@ -350,22 +307,21 @@ async def test_order_complete_event_contains_distribution_winner_n_responses(
 async def test_done_event_contains_valid_research_brief(
     mock_rapidata: MagicMock,
 ) -> None:
-    dispatch_order = _make_order("ft::What do you think?", "ord_ft")
-    mock_rapidata.order.create_free_text_order.return_value = dispatch_order
+    dispatch_order = _make_order("mc::What do you prefer?", "ord_mc")
+    mock_rapidata.order.create_classification_order.return_value = dispatch_order
 
-    result_order = _make_order("ft::What do you think?", "ord_ft")
+    result_order = _make_order("mc::What do you prefer?", "ord_mc")
     result_order.get_status.return_value = "Completed"
-    df = pd.DataFrame({"response": ["great", "ok", "nice", "good"]})
-    raw = MagicMock()
-    raw.to_pandas.return_value = df
-    result_order.get_results.return_value = raw
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("A", 7), ("B", 3))
+    )
     mock_rapidata.order.get_order_by_id.return_value = result_order
 
     first_response = _claude_response(
         content=[
             _tool_use_block(
-                "ask_free_text",
-                {"question": "What do you think?", "n": 10},
+                "ask_multiple_choice",
+                {"question": "What do you prefer?", "options": ["A", "B"], "n": 10},
                 "tu_1",
             ),
         ]
@@ -377,14 +333,8 @@ async def test_done_event_contains_valid_research_brief(
                 {
                     "summary": "Respondents are generally positive.",
                     "sections": [
-                        {
-                            "title": "Sentiment",
-                            "content": "All four responses were positive.",
-                        },
-                        {
-                            "title": "Themes",
-                            "content": "Common words: great, good, nice, ok.",
-                        },
+                        {"title": "Sentiment", "content": "All four responses were positive."},
+                        {"title": "Themes", "content": "Common words: great, good, nice, ok."},
                     ],
                 },
                 "tu_2",
@@ -393,27 +343,20 @@ async def test_done_event_contains_valid_research_brief(
     )
 
     mock_client = MagicMock()
-    mock_client.messages.create = AsyncMock(
-        side_effect=[first_response, second_response]
-    )
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
 
     with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            raw_events = await _collect_events(
-                client, "/research/stream?question=What+do+you+think%3F"
-            )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            raw_events = await _collect_events(client, "What do you prefer?")
 
     done_events = [e for e in raw_events if e["event"] == "done"]
     assert len(done_events) == 1
 
     parsed = _parse_event(done_events[0])
     assert isinstance(parsed, DoneEvent)
-
     brief = parsed.brief
     assert isinstance(brief, ResearchBrief)
-    assert brief.question == "What do you think?"
+    assert brief.question == "What do you prefer?"
     assert len(brief.sections) == 2
     assert brief.sections[0].title == "Sentiment"
     assert brief.sections[1].title == "Themes"
@@ -428,23 +371,16 @@ async def test_order_complete_compare_has_distribution_and_winner(
 
     result_order = _make_order("cmp::Which is better?", "ord_cmp")
     result_order.get_status.return_value = "Completed"
-    # option_a gets 7, option_b gets 3
-    df = pd.DataFrame({"a_votes": [7], "b_votes": [3]})
-    raw = MagicMock()
-    raw.to_pandas.return_value = df
-    result_order.get_results.return_value = raw
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: pd.DataFrame({"a_votes": [7], "b_votes": [3]})
+    )
     mock_rapidata.order.get_order_by_id.return_value = result_order
 
     first_response = _claude_response(
         content=[
             _tool_use_block(
                 "compare",
-                {
-                    "question": "Which is better?",
-                    "option_a": "Alpha",
-                    "option_b": "Beta",
-                    "n": 10,
-                },
+                {"question": "Which is better?", "option_a": "Alpha", "option_b": "Beta", "n": 10},
                 "tu_1",
             ),
         ]
@@ -455,9 +391,7 @@ async def test_order_complete_compare_has_distribution_and_winner(
                 "complete_research",
                 {
                     "summary": "Alpha is preferred.",
-                    "sections": [
-                        {"title": "Comparison", "content": "Alpha 7, Beta 3."}
-                    ],
+                    "sections": [{"title": "Comparison", "content": "Alpha 7, Beta 3."}],
                 },
                 "tu_2",
             ),
@@ -465,26 +399,18 @@ async def test_order_complete_compare_has_distribution_and_winner(
     )
 
     mock_client = MagicMock()
-    mock_client.messages.create = AsyncMock(
-        side_effect=[first_response, second_response]
-    )
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
 
     with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            raw_events = await _collect_events(
-                client, "/research/stream?question=Which+is+better%3F"
-            )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            raw_events = await _collect_events(client, "Which is better?")
 
     complete_events = [e for e in raw_events if e["event"] == "order_complete"]
     assert len(complete_events) == 1
 
     parsed = _parse_event(complete_events[0])
     assert isinstance(parsed, OrderCompleteEvent)
-    assert parsed.distribution is not None
-    assert parsed.distribution["option_a"] == 7
-    assert parsed.distribution["option_b"] == 3
+    assert parsed.distribution == {"option_a": 7, "option_b": 3}
     assert parsed.winner == "option_a"
     assert parsed.n_responses == 10
 
@@ -495,10 +421,9 @@ async def test_event_sequence_order_is_correct(mock_rapidata: MagicMock) -> None
 
     result_order = _make_order("mc::Sequence test?", "ord_seq")
     result_order.get_status.return_value = "Completed"
-    df = pd.DataFrame({"answer": ["yes", "no", "yes"]})
-    raw = MagicMock()
-    raw.to_pandas.return_value = df
-    result_order.get_results.return_value = raw
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("yes", 2), ("no", 1))
+    )
     mock_rapidata.order.get_order_by_id.return_value = result_order
 
     first_response = _claude_response(
@@ -515,47 +440,299 @@ async def test_event_sequence_order_is_correct(mock_rapidata: MagicMock) -> None
         content=[
             _tool_use_block(
                 "complete_research",
-                {
-                    "summary": "Yes wins.",
-                    "sections": [{"title": "Result", "content": "Yes: 2, No: 1."}],
-                },
+                {"summary": "Yes wins.", "sections": [{"title": "Result", "content": "Yes: 2, No: 1."}]},
                 "tu_2",
             ),
         ]
     )
 
     mock_client = MagicMock()
-    mock_client.messages.create = AsyncMock(
-        side_effect=[first_response, second_response]
-    )
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
 
     with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            raw_events = await _collect_events(
-                client, "/research/stream?question=Sequence+test%3F"
-            )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            raw_events = await _collect_events(client, "Sequence test?")
 
     event_types = [str(e["event"]) for e in raw_events]
 
-    # agent_thought must come before order_dispatched
     idx_thought = event_types.index("agent_thought")
     idx_dispatched = event_types.index("order_dispatched")
     assert idx_thought < idx_dispatched
 
-    # order_dispatched before order_progress
     idx_progress = event_types.index("order_progress")
     assert idx_dispatched < idx_progress
 
-    # order_progress before order_complete
     idx_complete = event_types.index("order_complete")
     assert idx_progress < idx_complete
 
-    # order_complete before brief_update
     idx_brief = event_types.index("brief_update")
     assert idx_complete < idx_brief
 
-    # brief_update before done
     idx_done = event_types.index("done")
     assert idx_brief < idx_done
+
+
+# ---------------------------------------------------------------------------
+# Clarifying question tests
+#
+# ASGITransport buffers the entire SSE response before returning it, so
+# concurrent "POST /research/answer" requests from inside the stream reader
+# would deadlock. Instead, we pre-populate _pending_answers before the stream
+# starts. _await_answer checks that dict first and returns immediately — no
+# blocking, no deadlock.
+# ---------------------------------------------------------------------------
+
+import human_use.api as _api_module
+
+
+def _pre_answer(session_id: str, answers: dict[int, str]) -> None:
+    """Pre-populate answers so _await_answer returns without waiting."""
+    for q_idx, answer in answers.items():
+        _api_module._pending_answers[(session_id, q_idx)] = answer
+
+
+async def test_clarifying_question_event_is_emitted(mock_rapidata: MagicMock) -> None:
+    """Agent emits clarifying_question SSE event and then proceeds to dispatch a survey."""
+    dispatch_order = _make_order("mc::What do you prefer?", "ord_mc_cq")
+    mock_rapidata.order.create_classification_order.return_value = dispatch_order
+
+    result_order = _make_order("mc::What do you prefer?", "ord_mc_cq")
+    result_order.get_status.return_value = "Completed"
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("A", 2), ("B", 1))
+    )
+    mock_rapidata.order.get_order_by_id.return_value = result_order
+
+    first_response = _claude_response(
+        content=[
+            _text_block("Let me clarify the scope first."),
+            _tool_use_block(
+                "ask_clarifying_question",
+                {"question": "What age group are you targeting?", "options": ["18-25", "26-40", "41+"]},
+                "tu_cq_1",
+            ),
+        ]
+    )
+    second_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "ask_multiple_choice",
+                {"question": "What do you prefer?", "options": ["A", "B"], "n": 10},
+                "tu_mc_1",
+            ),
+        ]
+    )
+    third_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "A wins.", "sections": [{"title": "Result", "content": "A: 2, B: 1."}]},
+                "tu_cr_1",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response, third_response])
+
+    session_id = "test_cq_emitted"
+    _pre_answer(session_id, {0: "18-25"})
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_events(client, "Research question", session_id)
+
+    event_types = [e["event"] for e in events]
+    assert "clarifying_question" in event_types
+    assert "order_dispatched" in event_types
+    assert "done" in event_types
+    assert event_types.index("clarifying_question") < event_types.index("order_dispatched")
+
+
+async def test_clarifying_question_event_deserializes_correctly(
+    mock_rapidata: MagicMock,
+) -> None:
+    """clarifying_question SSE event deserializes into ClarifyingQuestionEvent."""
+    first_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "ask_clarifying_question",
+                {"question": "Which industry?", "options": ["Tech", "Finance", "Healthcare"]},
+                "tu_cq_1",
+            ),
+        ]
+    )
+    second_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "Done.", "sections": [{"title": "Result", "content": "Research complete."}]},
+                "tu_cr_1",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
+
+    session_id = "test_cq_deser"
+    _pre_answer(session_id, {0: "Tech"})
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_events(client, "Industry research", session_id)
+
+    cq_events = [e for e in events if e.get("event") == "clarifying_question"]
+    assert len(cq_events) == 1
+
+    parsed = _parse_event(cq_events[0])
+    assert isinstance(parsed, ClarifyingQuestionEvent)
+    assert parsed.question == "Which industry?"
+    assert parsed.session_id == session_id
+    assert parsed.question_index == 0
+    assert len(parsed.options) == 4
+    assert "Other (please specify)" in parsed.options
+    assert "Tech" in parsed.options
+
+
+async def test_research_answer_endpoint_resolves_pending_event() -> None:
+    """POST /research/answer sets the asyncio.Event and returns {ok: true}."""
+    session_id = "test_answer_ep"
+    q_idx = 0
+
+    ev = asyncio.Event()
+    _api_module._pending_events[(session_id, q_idx)] = ev
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/research/answer",
+            json={"session_id": session_id, "question_index": q_idx, "answer": "Finance"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert ev.is_set()
+    assert _api_module._pending_answers.get((session_id, q_idx)) == "Finance"
+
+
+async def test_agent_receives_clarifying_answer_before_proceeding(
+    mock_rapidata: MagicMock,
+) -> None:
+    """The clarifying answer string is returned by _await_answer and passed as the tool result."""
+    dispatch_order = _make_order("mc::Refined question", "ord_refined")
+    mock_rapidata.order.create_classification_order.return_value = dispatch_order
+
+    result_order = _make_order("mc::Refined question", "ord_refined")
+    result_order.get_status.return_value = "Completed"
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("yes", 2), ("no", 1))
+    )
+    mock_rapidata.order.get_order_by_id.return_value = result_order
+
+    received_tool_results: list[dict[str, object]] = []
+    call_idx = 0
+
+    async def capturing_create(**kwargs: object) -> MagicMock:
+        nonlocal call_idx
+        # Capture tool_results from the last user message only
+        for msg in reversed(list(kwargs.get("messages", []))):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "tool_result":
+                            received_tool_results.append(item)
+                break
+
+        idx = call_idx
+        call_idx += 1
+
+        if idx == 0:
+            return _claude_response(
+                content=[
+                    _tool_use_block(
+                        "ask_clarifying_question",
+                        {"question": "Who is the target?", "options": ["Consumers", "Businesses", "Both"]},
+                        "tu_cq_1",
+                    ),
+                ]
+            )
+        elif idx == 1:
+            return _claude_response(
+                content=[
+                    _tool_use_block(
+                        "ask_multiple_choice",
+                        {"question": "Refined question", "options": ["yes", "no"], "n": 10},
+                        "tu_mc_1",
+                    ),
+                ]
+            )
+        else:
+            return _claude_response(
+                content=[
+                    _tool_use_block(
+                        "complete_research",
+                        {"summary": "Done.", "sections": [{"title": "R", "content": "C."}]},
+                        "tu_cr_1",
+                    ),
+                ]
+            )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=capturing_create)
+
+    session_id = "test_answer_flow"
+    _pre_answer(session_id, {0: "Consumers"})
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_events(client, "Target audience research", session_id)
+
+    event_types = [e["event"] for e in events]
+    assert event_types.index("clarifying_question") < event_types.index("order_dispatched")
+
+    assert any(
+        r.get("content") == "Consumers" for r in received_tool_results
+    ), f"Expected 'Consumers' in tool results, got: {received_tool_results}"
+
+
+async def test_clarifying_question_options_include_other(
+    mock_rapidata: MagicMock,
+) -> None:
+    """Backend always appends 'Other (please specify)' as the fourth option."""
+    first_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "ask_clarifying_question",
+                {"question": "What matters most?", "options": ["Price", "Quality", "Speed"]},
+                "tu_cq_1",
+            ),
+        ]
+    )
+    second_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "Done.", "sections": [{"title": "R", "content": "C."}]},
+                "tu_cr_1",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
+
+    session_id = "test_options_other"
+    _pre_answer(session_id, {0: "Price"})
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_events(client, "What matters?", session_id)
+
+    cq_events = [e for e in events if e.get("event") == "clarifying_question"]
+    assert len(cq_events) == 1
+
+    options = cq_events[0]["options"]
+    assert len(options) == 4
+    assert options[:3] == ["Price", "Quality", "Speed"]
+    assert options[3] == "Other (please specify)"

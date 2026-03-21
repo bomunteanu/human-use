@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import NotRequired, TypedDict, cast
 
 import anthropic
@@ -9,6 +10,7 @@ from human_use.models import (
     AgentThoughtEvent,
     BriefSection,
     BriefUpdateEvent,
+    ClarifyingQuestionEvent,
     CompareResult,
     DoneEvent,
     MultipleChoiceResult,
@@ -17,9 +19,9 @@ from human_use.models import (
     OrderProgressEvent,
     ResearchBrief,
     SSEEvent,
+    TargetingConfig,
 )
 from human_use.tools import (
-    ask_free_text,
     ask_multiple_choice,
     check_progress,
     compare,
@@ -28,32 +30,36 @@ from human_use.tools import (
 )
 
 POLL_INTERVAL: float = 5.0
-MAX_SURVEYS: int = 5
+MAX_SURVEYS: int = 1
+MAX_CLARIFICATIONS: int = 3
 
 _DISPATCH_TOOLS: list[anthropic.types.ToolParam] = [
     {
-        "name": "ask_free_text",
+        "name": "ask_clarifying_question",
         "description": (
-            "Dispatch a free-text question to real humans. "
-            "Returns immediately. Results will be retrieved automatically."
+            "Ask the user a clarifying multiple-choice question before dispatching surveys. "
+            "Use this at most 3 times to understand the research goal better. "
+            "Always ask clarifying questions FIRST, then dispatch surveys."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "question": {
                     "type": "string",
-                    "description": "The question to ask humans",
+                    "description": "The clarifying question to ask the user",
                 },
-                "n": {
-                    "type": "integer",
-                    "description": "Number of responses to collect",
-                },
-                "language": {
-                    "type": "string",
-                    "description": "ISO 639-1 language code (optional)",
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Exactly 3 answer options (a 4th 'Other (please specify)' "
+                        "option is appended automatically)"
+                    ),
+                    "minItems": 3,
+                    "maxItems": 3,
                 },
             },
-            "required": ["question", "n"],
+            "required": ["question", "options"],
         },
     },
     {
@@ -139,13 +145,15 @@ _DISPATCH_TOOLS: list[anthropic.types.ToolParam] = [
     },
 ]
 
-_DISPATCH_TOOL_NAMES = {"ask_free_text", "ask_multiple_choice", "compare", "rank"}
+_SURVEY_TOOL_NAMES = {"ask_multiple_choice", "compare", "rank"}
+_CLARIFY_TOOL_NAMES = {"ask_clarifying_question"}
 
 
-class _AskFreeTextInput(TypedDict):
+class _AskClarifyingQuestionInput(TypedDict):
     question: str
-    n: int
-    language: NotRequired[str | None]
+    options: list[str]
+
+
 
 
 class _AskMultipleChoiceInput(TypedDict):
@@ -180,14 +188,7 @@ class _CompleteResearchInput(TypedDict):
     sections: list[_BriefSectionInput]
 
 
-async def _dispatch(tool_name: str, raw_input: object) -> str:
-    if tool_name == "ask_free_text":
-        inp = cast(_AskFreeTextInput, raw_input)
-        return await ask_free_text(
-            question=inp["question"],
-            n=inp["n"],
-            language=inp.get("language"),
-        )
+async def _dispatch(tool_name: str, raw_input: object, targeting: TargetingConfig | None = None) -> str:
     if tool_name == "ask_multiple_choice":
         inp2 = cast(_AskMultipleChoiceInput, raw_input)
         return await ask_multiple_choice(
@@ -195,6 +196,7 @@ async def _dispatch(tool_name: str, raw_input: object) -> str:
             options=inp2["options"],
             n=inp2["n"],
             language=inp2.get("language"),
+            targeting=targeting,
         )
     if tool_name == "compare":
         inp3 = cast(_CompareInput, raw_input)
@@ -204,6 +206,7 @@ async def _dispatch(tool_name: str, raw_input: object) -> str:
             option_b=inp3["option_b"],
             n=inp3["n"],
             language=inp3.get("language"),
+            targeting=targeting,
         )
     if tool_name == "rank":
         inp4 = cast(_RankInput, raw_input)
@@ -212,6 +215,7 @@ async def _dispatch(tool_name: str, raw_input: object) -> str:
             items=inp4["items"],
             n=inp4["n"],
             language=inp4.get("language"),
+            targeting=targeting,
         )
     raise ValueError(f"Unknown dispatch tool: {tool_name!r}")
 
@@ -219,10 +223,13 @@ async def _dispatch(tool_name: str, raw_input: object) -> str:
 async def run_agent(
     question: str,
     queue: asyncio.Queue[SSEEvent | None],
+    session_id: str,
+    answer_awaiter: Callable[[int], Awaitable[str]],
     poll_interval: float = POLL_INTERVAL,
+    targeting: TargetingConfig | None = None,
 ) -> None:
     try:
-        await _run_agent_inner(question, queue, poll_interval)
+        await _run_agent_inner(question, queue, session_id, answer_awaiter, poll_interval, targeting)
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -233,39 +240,52 @@ async def run_agent(
 _SYSTEM_PROMPT_TEMPLATE = (
     "You are a research agent. Given a research question, you use human intelligence tools "
     "to gather data from real people, then synthesize the findings into a research brief. "
-    "Dispatch appropriate Rapidata orders based on the question. After gathering sufficient "
-    "data, call complete_research with a structured brief. Be thorough but efficient.\n\n"
-    "IMPORTANT: You may dispatch at most {max_surveys} surveys in total. "
-    "You have {remaining} surveys remaining. "
+    "Be thorough but efficient.\n\n"
+    "STEP 1 — CLARIFY: Before dispatching any surveys, ask at most {max_clarifications} "
+    "clarifying questions using ask_clarifying_question to better understand the research "
+    "goal. You have {remaining_clarifications} clarifying questions remaining. "
+    "Once you have sufficient clarity, proceed to Step 2.\n\n"
+    "STEP 2 — SURVEY: Dispatch appropriate Rapidata orders based on the clarified goal. "
+    "You may dispatch at most {max_surveys} surveys in total. "
+    "You have {remaining_surveys} surveys remaining. "
     "When you have {soft_cap} or fewer surveys left, prefer calling complete_research "
-    "with the data you have rather than dispatching more surveys."
+    "with the data you have rather than dispatching more surveys.\n\n"
+    "STEP 3 — BRIEF: Call complete_research with a structured brief once you have "
+    "gathered sufficient data."
 )
 
 
 async def _run_agent_inner(
     question: str,
     queue: asyncio.Queue[SSEEvent | None],
+    session_id: str,
+    answer_awaiter: Callable[[int], Awaitable[str]],
     poll_interval: float,
+    targeting: TargetingConfig | None = None,
 ) -> None:
     client = anthropic.AsyncAnthropic()
     surveys_dispatched: int = 0
+    clarifications_dispatched: int = 0
 
     messages: list[anthropic.types.MessageParam] = [
         {
             "role": "user",
             "content": (
                 f"Research question: {question}\n\n"
-                "Gather human intelligence using the available tools, "
-                "then call complete_research with your findings."
+                "First ask any clarifying questions you need, then gather human intelligence "
+                "using the survey tools, then call complete_research with your findings."
             ),
         }
     ]
 
     while True:
-        remaining = MAX_SURVEYS - surveys_dispatched
+        remaining_surveys = MAX_SURVEYS - surveys_dispatched
+        remaining_clarifications = MAX_CLARIFICATIONS - clarifications_dispatched
         system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+            max_clarifications=MAX_CLARIFICATIONS,
+            remaining_clarifications=remaining_clarifications,
             max_surveys=MAX_SURVEYS,
-            remaining=remaining,
+            remaining_surveys=remaining_surveys,
             soft_cap=1,
         )
         response = await client.messages.create(
@@ -326,7 +346,48 @@ async def _run_agent_inner(
                 await queue.put(None)
                 return
 
-            if block.name not in _DISPATCH_TOOL_NAMES:
+            if block.name in _CLARIFY_TOOL_NAMES:
+                if clarifications_dispatched >= MAX_CLARIFICATIONS:
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": (
+                                f"Clarification limit reached ({MAX_CLARIFICATIONS}). "
+                                "Proceed to dispatch surveys now."
+                            ),
+                            "is_error": True,
+                        }
+                    )
+                    continue
+
+                inp_cq = cast(_AskClarifyingQuestionInput, block.input)
+                base_options = list(inp_cq["options"])[:3]
+                options = base_options + ["Other (please specify)"]
+                q_idx = clarifications_dispatched
+                clarifications_dispatched += 1
+
+                await queue.put(
+                    ClarifyingQuestionEvent(
+                        session_id=session_id,
+                        question_index=q_idx,
+                        question=inp_cq["question"],
+                        options=options,
+                    )
+                )
+
+                answer = await answer_awaiter(q_idx)
+
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": answer,
+                    }
+                )
+                continue
+
+            if block.name not in _SURVEY_TOOL_NAMES:
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -352,7 +413,7 @@ async def _run_agent_inner(
                 continue
 
             surveys_dispatched += 1
-            order_id = await _dispatch(block.name, block.input)
+            order_id = await _dispatch(block.name, block.input, targeting)
             question_text = str(
                 cast(dict[str, object], block.input).get("question", "")
             )

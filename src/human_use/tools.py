@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from rapidata import LanguageFilter
+from rapidata import CountryFilter, LanguageFilter
 
 from human_use.client import get_client, run_sync
 from human_use.models import (
@@ -13,20 +13,55 @@ from human_use.models import (
     RankedItem,
     RankResult,
     Result,
+    TargetingConfig,
 )
 
 RESPONSES_PER_DATAPOINT = 10
 
+# Map common language names the LLM might produce → ISO 639-1 two-letter codes.
+# LanguageFilter validates that codes are exactly 2 characters.
+_LANG_NAME_TO_CODE: dict[str, str] = {
+    "afrikaans": "af", "albanian": "sq", "arabic": "ar", "armenian": "hy",
+    "azerbaijani": "az", "basque": "eu", "belarusian": "be", "bengali": "bn",
+    "bosnian": "bs", "bulgarian": "bg", "catalan": "ca", "chinese": "zh",
+    "croatian": "hr", "czech": "cs", "danish": "da", "dutch": "nl",
+    "english": "en", "estonian": "et", "finnish": "fi", "french": "fr",
+    "galician": "gl", "georgian": "ka", "german": "de", "greek": "el",
+    "gujarati": "gu", "hebrew": "he", "hindi": "hi", "hungarian": "hu",
+    "icelandic": "is", "indonesian": "id", "irish": "ga", "italian": "it",
+    "japanese": "ja", "kannada": "kn", "kazakh": "kk", "korean": "ko",
+    "latvian": "lv", "lithuanian": "lt", "macedonian": "mk", "malay": "ms",
+    "maltese": "mt", "norwegian": "no", "persian": "fa", "polish": "pl",
+    "portuguese": "pt", "punjabi": "pa", "romanian": "ro", "russian": "ru",
+    "serbian": "sr", "slovak": "sk", "slovenian": "sl", "spanish": "es",
+    "swahili": "sw", "swedish": "sv", "tamil": "ta", "telugu": "te",
+    "thai": "th", "turkish": "tr", "ukrainian": "uk", "urdu": "ur",
+    "uzbek": "uz", "vietnamese": "vi", "welsh": "cy",
+}
 
-def _filters(language: str | None) -> list:
-    return [LanguageFilter([language])] if language else []
+
+def _normalize_language(language: str) -> str:
+    """Return a 2-letter ISO 639-1 code regardless of whether the agent
+    passed a full name ('English') or a code ('en')."""
+    if len(language) == 2:
+        return language.lower()
+    return _LANG_NAME_TO_CODE.get(language.lower(), language)
+
+
+def _filters(language: str | None, targeting: TargetingConfig | None = None) -> list:
+    filters: list = []
+    if language:
+        filters.append(LanguageFilter([_normalize_language(language)]))
+    if targeting and targeting.country_codes:
+        filters.append(CountryFilter(targeting.country_codes))
+    return filters
 
 
 def _n_datapoints(n: int) -> int:
     return max(1, math.ceil(n / RESPONSES_PER_DATAPOINT))
 
 
-async def ask_free_text(question: str, n: int, language: str | None = None) -> str:
+async def ask_free_text(question: str, n: int, language: str | None = None, targeting: TargetingConfig | None = None) -> str:
     """
     Dispatch a free-text question to real humans and return an order_id immediately.
 
@@ -55,7 +90,7 @@ async def ask_free_text(question: str, n: int, language: str | None = None) -> s
             instruction=question,
             datapoints=datapoints,
             responses_per_datapoint=RESPONSES_PER_DATAPOINT,
-            filters=_filters(language),
+            filters=_filters(language, targeting),
             data_type="text",
         )
         order.run()
@@ -69,6 +104,7 @@ async def ask_multiple_choice(
     options: list[str],
     n: int,
     language: str | None = None,
+    targeting: TargetingConfig | None = None,
 ) -> str:
     """
     Dispatch a multiple-choice poll to real humans and return an order_id immediately.
@@ -100,7 +136,7 @@ async def ask_multiple_choice(
             answer_options=options,
             datapoints=datapoints,
             responses_per_datapoint=RESPONSES_PER_DATAPOINT,
-            filters=_filters(language),
+            filters=_filters(language, targeting),
             data_type="text",
         )
         order.run()
@@ -115,6 +151,7 @@ async def compare(
     option_b: str,
     n: int,
     language: str | None = None,
+    targeting: TargetingConfig | None = None,
 ) -> str:
     """
     Dispatch a pairwise comparison to real humans and return an order_id immediately.
@@ -147,7 +184,7 @@ async def compare(
             instruction=question,
             datapoints=datapoints,
             responses_per_datapoint=RESPONSES_PER_DATAPOINT,
-            filters=_filters(language),
+            filters=_filters(language, targeting),
             data_type="text",
         )
         order.run()
@@ -161,6 +198,7 @@ async def rank(
     items: list[str],
     n: int,
     language: str | None = None,
+    targeting: TargetingConfig | None = None,
 ) -> str:
     """
     Dispatch a ranking task to real humans and return an order_id immediately.
@@ -190,6 +228,7 @@ async def rank(
             datapoints=[items],
             comparison_budget_per_ranking=n,
             data_type="text",
+            filters=_filters(language, targeting) or None,
         )
         order.run()
         return order.id
@@ -328,6 +367,31 @@ async def get_results(order_id: str) -> Result:
             )
 
     return await run_sync(_fetch)  # type: ignore[return-value]
+
+
+async def ask_clarifying_question(question: str, options: list[str]) -> str:
+    """
+    Ask the user a clarifying multiple-choice question before dispatching surveys.
+
+    Use this at most 3 times to understand the research goal before dispatching any
+    Rapidata orders. Ask clarifying questions first, then proceed to surveys.
+
+    The tool automatically appends "Other (please specify)" as a fourth option, so
+    pass exactly 3 options.
+
+    Args:
+        question: The clarifying question to ask the user.
+        options: Exactly 3 answer options to present.
+
+    Returns:
+        The user's selected answer as a string.
+
+    Note: This tool requires the interactive web frontend (/research/stream endpoint).
+    """
+    raise NotImplementedError(
+        "ask_clarifying_question requires the interactive web frontend. "
+        "Use the /research/stream endpoint with a session_id."
+    )
 
 
 async def check_progress(order_id: str) -> ProgressResult:

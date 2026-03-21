@@ -60,82 +60,6 @@ def make_order(name: str, order_id: str = "ord_123") -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# ask_free_text
-# ---------------------------------------------------------------------------
-
-
-def test_ask_free_text_returns_order_id(mock_rapidata):
-    order = make_order("ft::What do you think?")
-    mock_rapidata.order.create_free_text_order.return_value = order
-
-    result = asyncio.run(tools.ask_free_text("What do you think?", n=10))
-
-    assert result == "ord_123"
-
-
-def test_ask_free_text_calls_correct_sdk_method(mock_rapidata):
-    order = make_order("ft::Q")
-    mock_rapidata.order.create_free_text_order.return_value = order
-
-    asyncio.run(tools.ask_free_text("Q", n=10))
-
-    mock_rapidata.order.create_free_text_order.assert_called_once()
-
-
-def test_ask_free_text_hardcodes_responses_per_datapoint(mock_rapidata):
-    order = make_order("ft::Q")
-    mock_rapidata.order.create_free_text_order.return_value = order
-
-    asyncio.run(tools.ask_free_text("Q", n=10))
-
-    _, kwargs = mock_rapidata.order.create_free_text_order.call_args
-    assert kwargs["responses_per_datapoint"] == RESPONSES_PER_DATAPOINT
-
-
-def test_ask_free_text_no_language_filter_when_omitted(mock_rapidata):
-    order = make_order("ft::Q")
-    mock_rapidata.order.create_free_text_order.return_value = order
-
-    asyncio.run(tools.ask_free_text("Q", n=10))
-
-    _, kwargs = mock_rapidata.order.create_free_text_order.call_args
-    assert kwargs["filters"] == []
-
-
-def test_ask_free_text_language_filter_applied(mock_rapidata):
-    from rapidata import LanguageFilter
-
-    order = make_order("ft::Q")
-    mock_rapidata.order.create_free_text_order.return_value = order
-
-    asyncio.run(tools.ask_free_text("Q", n=10, language="en"))
-
-    _, kwargs = mock_rapidata.order.create_free_text_order.call_args
-    assert len(kwargs["filters"]) == 1
-    assert isinstance(kwargs["filters"][0], LanguageFilter)
-
-
-def test_ask_free_text_n_greater_than_10_creates_multiple_datapoints(mock_rapidata):
-    order = make_order("ft::Q")
-    mock_rapidata.order.create_free_text_order.return_value = order
-
-    asyncio.run(tools.ask_free_text("Q", n=20))
-
-    _, kwargs = mock_rapidata.order.create_free_text_order.call_args
-    assert len(kwargs["datapoints"]) == 2
-    assert kwargs["responses_per_datapoint"] == RESPONSES_PER_DATAPOINT
-
-
-def test_ask_free_text_calls_run_on_order(mock_rapidata):
-    order = make_order("ft::Q")
-    mock_rapidata.order.create_free_text_order.return_value = order
-
-    asyncio.run(tools.ask_free_text("Q", n=10))
-
-    order.run.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
 # ask_multiple_choice
 # ---------------------------------------------------------------------------
 
@@ -420,7 +344,7 @@ def test_get_results_free_text_order_type(mock_rapidata):
 
 def test_get_results_multiple_choice_returns_correct_type(mock_rapidata):
     order = make_order("mc::Which color?")
-    df = pd.DataFrame({"answer": ["red", "blue", "red", "red", "blue"]})
+    df = pd.DataFrame({"aggregatedResults_red": [3], "aggregatedResults_blue": [2]})
     raw = MagicMock()
     raw.to_pandas.return_value = df
     order.get_results.return_value = raw
@@ -433,7 +357,7 @@ def test_get_results_multiple_choice_returns_correct_type(mock_rapidata):
 
 def test_get_results_multiple_choice_winner(mock_rapidata):
     order = make_order("mc::Q")
-    df = pd.DataFrame({"answer": ["red", "blue", "red", "red", "blue"]})
+    df = pd.DataFrame({"aggregatedResults_red": [3], "aggregatedResults_blue": [2]})
     raw = MagicMock()
     raw.to_pandas.return_value = df
     order.get_results.return_value = raw
@@ -447,7 +371,7 @@ def test_get_results_multiple_choice_winner(mock_rapidata):
 
 def test_get_results_multiple_choice_distribution(mock_rapidata):
     order = make_order("mc::Q")
-    df = pd.DataFrame({"answer": ["A", "B", "A", "C", "A"]})
+    df = pd.DataFrame({"aggregatedResults_A": [3], "aggregatedResults_B": [1], "aggregatedResults_C": [1]})
     raw = MagicMock()
     raw.to_pandas.return_value = df
     order.get_results.return_value = raw
@@ -462,7 +386,7 @@ def test_get_results_multiple_choice_distribution(mock_rapidata):
 
 def test_get_results_multiple_choice_confidence(mock_rapidata):
     order = make_order("mc::Q")
-    df = pd.DataFrame({"answer": ["A", "A", "A", "B", "B"]})
+    df = pd.DataFrame({"aggregatedResults_A": [3], "aggregatedResults_B": [2]})
     raw = MagicMock()
     raw.to_pandas.return_value = df
     order.get_results.return_value = raw
@@ -475,7 +399,7 @@ def test_get_results_multiple_choice_confidence(mock_rapidata):
 
 def test_get_results_multiple_choice_order_type(mock_rapidata):
     order = make_order("mc::Q")
-    df = pd.DataFrame({"answer": ["A"]})
+    df = pd.DataFrame({"aggregatedResults_A": [1]})
     raw = MagicMock()
     raw.to_pandas.return_value = df
     order.get_results.return_value = raw
