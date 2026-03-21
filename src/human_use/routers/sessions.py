@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from human_use.auth import get_current_user
-from human_use.crud import delete_session, get_session_with_messages, get_sessions
+from human_use.crud import delete_session, get_session_with_messages, get_sessions, rename_session
 from human_use.db import get_session as get_db
 from human_use.db_models import User
 
@@ -67,6 +67,25 @@ async def get_session_detail(
         brief=session.brief,
         messages=[{"role": m.role, "content": m.content} for m in messages],
     )
+
+
+class RenameRequest(BaseModel):
+    title: str
+
+
+@router.patch("/{session_id}", status_code=204)
+async def rename_session_endpoint(
+    session_id: uuid.UUID,
+    body: RenameRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> None:
+    updated = await rename_session(db, session_id, current_user.id, body.title)
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found",
+        )
 
 
 @router.delete("/{session_id}", status_code=204)

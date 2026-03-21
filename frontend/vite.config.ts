@@ -11,6 +11,6 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    include: ["@react-pdf/renderer", "react-is"],
+    include: ["@react-pdf/renderer", "react-is", "react-simple-maps"],
   },
 })

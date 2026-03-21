@@ -18,6 +18,7 @@ from human_use.models import (
     MultipleChoiceResult,
     OrderCompleteEvent,
     OrderDispatchedEvent,
+    OrderPartialResultsEvent,
     OrderProgressEvent,
     ResearchBrief,
     SSEEvent,
@@ -28,6 +29,7 @@ from human_use.tools import (
     ask_multiple_choice,
     check_progress,
     compare,
+    get_preliminary_results,
     get_results,
     rank,
 )
@@ -460,7 +462,12 @@ async def _run_agent_inner(
 
             if block.name == "complete_research":
                 inp = cast(_CompleteResearchInput, block.input)
-                sections = [BriefSection(**s) for s in inp["sections"]]
+                raw_sections = inp["sections"]
+                sections = [
+                    BriefSection(**s) if isinstance(s, dict)
+                    else BriefSection(title="Finding", content=str(s))
+                    for s in raw_sections
+                ]
                 brief = ResearchBrief(
                     question=question,
                     title=inp.get("title") or question,
@@ -636,13 +643,40 @@ async def _run_agent_inner(
 
             while True:
                 progress = await check_progress(order_id)
-                await queue.put(
-                    OrderProgressEvent(
-                        order_id=order_id,
-                        status=progress.status,
-                        is_complete=progress.is_complete,
+
+                # Try to get preliminary results for live chart updates
+                # Skip if already complete — SDK rejects preliminary_results=True on completed orders
+                partial = None if progress.is_complete else await get_preliminary_results(order_id)
+                if partial is not None:
+                    partial_dist: dict[str, int] | None = None
+                    partial_winner: str | None = None
+                    if isinstance(partial, MultipleChoiceResult):
+                        partial_dist = partial.distribution
+                        partial_winner = partial.winner
+                    elif isinstance(partial, CompareResult):
+                        partial_dist = {
+                            "option_a": partial.option_a_votes,
+                            "option_b": partial.option_b_votes,
+                        }
+                        partial_winner = partial.winner
+                    await queue.put(
+                        OrderPartialResultsEvent(
+                            order_id=order_id,
+                            distribution=partial_dist,
+                            winner=partial_winner,
+                            n_responses=partial.n_responses,
+                            country_counts=partial.country_counts,
+                        )
                     )
-                )
+                else:
+                    await queue.put(
+                        OrderProgressEvent(
+                            order_id=order_id,
+                            status=progress.status,
+                            is_complete=progress.is_complete,
+                        )
+                    )
+
                 if progress.is_complete:
                     break
                 await asyncio.sleep(poll_interval)
@@ -667,6 +701,7 @@ async def _run_agent_inner(
                     distribution=distribution,
                     winner=winner,
                     n_responses=result.n_responses,
+                    country_counts=result.country_counts,
                 )
             )
 
@@ -729,7 +764,11 @@ async def _run_compile_inner(
     for block in response.content:
         if block.type == "tool_use" and block.name == "complete_research":
             inp = cast(_CompleteResearchInput, block.input)
-            sections = [BriefSection(**s) for s in inp["sections"]]
+            sections = [
+                BriefSection(**s) if isinstance(s, dict)
+                else BriefSection(title="Finding", content=str(s))
+                for s in inp["sections"]
+            ]
             brief = ResearchBrief(
                 question=question,
                 title=inp.get("title") or question,

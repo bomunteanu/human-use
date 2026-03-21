@@ -278,6 +278,138 @@ async def rank(
     return await run_sync(_create)
 
 
+def _extract_country_counts(raw) -> dict[str, int]:
+    """Return ISO 3166-1 alpha-2 country code → response count from detailedResults."""
+    if raw is None:
+        return {}
+    try:
+        counts: dict[str, int] = {}
+        for item in raw.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            for resp in item.get("detailedResults") or []:
+                if not isinstance(resp, dict):
+                    continue
+                user_details = resp.get("userDetails") or {}
+                country = user_details.get("country") or resp.get("countryCode")
+                if country and len(str(country)) == 2:
+                    code = str(country).upper()
+                    counts[code] = counts.get(code, 0) + 1
+        return counts
+    except Exception:
+        return {}
+
+
+def _parse_order_result(order_id: str, order_name: str, raw) -> Result:
+    """Parse a RapidataResults object into a typed Result model."""
+    df = raw.to_pandas()
+
+    if order_name.startswith("ft::"):
+        text_cols = [c for c in df.columns if any(k in str(c).lower() for k in ("response", "answer", "text", "result"))]
+        col = text_cols[0] if text_cols else df.columns[-1]
+        responses = df[col].dropna().tolist()
+        flat: list[str] = []
+        for r in responses:
+            if isinstance(r, list):
+                flat.extend(str(x) for x in r if x is not None)
+            else:
+                flat.append(str(r))
+        return FreeTextResult(
+            order_id=order_id,
+            responses=flat,
+            n_responses=len(flat),
+            country_counts=_extract_country_counts(raw),
+        )
+
+    elif order_name.startswith("mc::"):
+        agg_cols = [
+            c for c in df.columns
+            if c.startswith("aggregatedResults_")
+            and not c.startswith("aggregatedResultsRatios_")
+        ]
+        counts: dict[str, int] = {
+            c.replace("aggregatedResults_", ""): int(df[c].sum())
+            for c in agg_cols
+        }
+        total = sum(counts.values())
+        winner = max(counts, key=lambda k: counts[k])
+        return MultipleChoiceResult(
+            order_id=order_id,
+            winner=winner,
+            distribution=counts,
+            confidence=counts[winner] / total if total else 0.0,
+            n_responses=total,
+            country_counts=_extract_country_counts(raw),
+        )
+
+    elif order_name.startswith("cmp::"):
+        a_cols = [c for c in df.columns if str(c).startswith("A_")]
+        b_cols = [c for c in df.columns if str(c).startswith("B_")]
+        if a_cols and b_cols:
+            a_votes = int(df[a_cols[0]].sum())
+            b_votes = int(df[b_cols[0]].sum())
+        else:
+            num_cols = df.select_dtypes("number").columns.tolist()
+            a_votes = int(df[num_cols[-2]].sum()) if len(num_cols) >= 2 else 0
+            b_votes = int(df[num_cols[-1]].sum()) if len(num_cols) >= 1 else 0
+        asset_a = str(df["assetA"].iloc[0]) if "assetA" in df.columns else "option_a"
+        asset_b = str(df["assetB"].iloc[0]) if "assetB" in df.columns else "option_b"
+        total = a_votes + b_votes
+        winner_text = asset_a if a_votes >= b_votes else asset_b
+        winner = "option_a" if a_votes >= b_votes else "option_b"
+        return CompareResult(
+            order_id=order_id,
+            winner=winner,
+            winner_text=winner_text,
+            option_a_votes=a_votes,
+            option_b_votes=b_votes,
+            confidence=max(a_votes, b_votes) / total if total else 0.0,
+            n_responses=total,
+            country_counts=_extract_country_counts(raw),
+        )
+
+    else:  # rnk::
+        # _compare_to_pandas() only handles 2 assets; parse raw dict directly.
+        scores: dict[str, float] = {}
+        total_votes = 0
+        for result_item in raw.get("results", []):
+            agg = result_item.get("aggregatedResults", {})
+            if isinstance(agg, dict):
+                for item_name, score in agg.items():
+                    try:
+                        scores[str(item_name)] = float(score)
+                    except (TypeError, ValueError):
+                        pass
+            votes = result_item.get("totalVotes") or result_item.get("votes", 0)
+            try:
+                total_votes += int(votes)
+            except (TypeError, ValueError):
+                pass
+
+        if not scores:
+            score_cols = [c for c in df.columns if "score" in str(c).lower() or "elo" in str(c).lower()]
+            item_cols = [c for c in df.columns if "item" in str(c).lower() or "text" in str(c).lower() or "asset" in str(c).lower()]
+            sort_col = score_cols[0] if score_cols else df.columns[-1]
+            item_col = item_cols[0] if item_cols else df.columns[0]
+            sorted_df = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+            rankings = [
+                RankedItem(item=str(row[item_col]), rank=i + 1, score=float(row[sort_col]))
+                for i, row in sorted_df.iterrows()
+            ]
+            return RankResult(order_id=order_id, rankings=rankings, n_responses=len(df))
+
+        sorted_items = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        rankings = [
+            RankedItem(item=item, rank=i + 1, score=score)
+            for i, (item, score) in enumerate(sorted_items)
+        ]
+        return RankResult(
+            order_id=order_id,
+            rankings=rankings,
+            n_responses=total_votes or len(rankings),
+        )
+
+
 async def get_results(order_id: str) -> Result:
     """
     Retrieve completed human responses for a dispatched order.
@@ -300,114 +432,33 @@ async def get_results(order_id: str) -> Result:
         client = get_client()
         order = client.order.get_order_by_id(order_id)
         raw = order.get_results()
-        df = raw.to_pandas()
-        name: str = order.name
-
-        if name.startswith("ft::"):
-            # Find the column most likely to contain free-text answers
-            text_cols = [c for c in df.columns if any(k in str(c).lower() for k in ("response", "answer", "text", "result"))]
-            col = text_cols[0] if text_cols else df.columns[-1]
-            responses = df[col].dropna().tolist()
-            # Flatten lists/dicts if needed
-            flat: list[str] = []
-            for r in responses:
-                if isinstance(r, list):
-                    flat.extend(str(x) for x in r if x is not None)
-                else:
-                    flat.append(str(r))
-            return FreeTextResult(order_id=order_id, responses=flat, n_responses=len(flat))
-
-        elif name.startswith("mc::"):
-            agg_cols = [
-                c for c in df.columns
-                if c.startswith("aggregatedResults_")
-                and not c.startswith("aggregatedResultsRatios_")
-            ]
-            counts: dict[str, int] = {
-                col.replace("aggregatedResults_", ""): int(df[col].sum())
-                for col in agg_cols
-            }
-            total = sum(counts.values())
-            winner = max(counts, key=lambda k: counts[k])
-            return MultipleChoiceResult(
-                order_id=order_id,
-                winner=winner,
-                distribution=counts,
-                confidence=counts[winner] / total if total else 0.0,
-                n_responses=total,
-            )
-
-        elif name.startswith("cmp::"):
-            # _compare_to_pandas produces A_<metric> and B_<metric> columns
-            a_cols = [c for c in df.columns if str(c).startswith("A_")]
-            b_cols = [c for c in df.columns if str(c).startswith("B_")]
-            if a_cols and b_cols:
-                a_votes = int(df[a_cols[0]].sum())
-                b_votes = int(df[b_cols[0]].sum())
-            else:
-                # Fallback: last two numeric columns
-                num_cols = df.select_dtypes("number").columns.tolist()
-                a_votes = int(df[num_cols[-2]].sum()) if len(num_cols) >= 2 else 0
-                b_votes = int(df[num_cols[-1]].sum()) if len(num_cols) >= 1 else 0
-            asset_a = str(df["assetA"].iloc[0]) if "assetA" in df.columns else "option_a"
-            asset_b = str(df["assetB"].iloc[0]) if "assetB" in df.columns else "option_b"
-            total = a_votes + b_votes
-            winner_text = asset_a if a_votes >= b_votes else asset_b
-            winner = "option_a" if a_votes >= b_votes else "option_b"
-            return CompareResult(
-                order_id=order_id,
-                winner=winner,
-                winner_text=winner_text,
-                option_a_votes=a_votes,
-                option_b_votes=b_votes,
-                confidence=max(a_votes, b_votes) / total if total else 0.0,
-                n_responses=total,
-            )
-
-        else:  # rnk::
-            # _compare_to_pandas() only handles 2 assets; parse raw dict directly.
-            # Each result item has aggregatedResults: {item_name: elo_score, ...}
-            scores: dict[str, float] = {}
-            total_votes = 0
-            for result_item in raw.get("results", []):
-                agg = result_item.get("aggregatedResults", {})
-                if isinstance(agg, dict):
-                    for item_name, score in agg.items():
-                        try:
-                            scores[str(item_name)] = float(score)
-                        except (TypeError, ValueError):
-                            pass
-                votes = result_item.get("totalVotes") or result_item.get("votes", 0)
-                try:
-                    total_votes += int(votes)
-                except (TypeError, ValueError):
-                    pass
-
-            if not scores:
-                # Fallback: try the DataFrame heuristic
-                score_cols = [c for c in df.columns if "score" in str(c).lower() or "elo" in str(c).lower()]
-                item_cols = [c for c in df.columns if "item" in str(c).lower() or "text" in str(c).lower() or "asset" in str(c).lower()]
-                sort_col = score_cols[0] if score_cols else df.columns[-1]
-                item_col = item_cols[0] if item_cols else df.columns[0]
-                sorted_df = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
-                rankings = [
-                    RankedItem(item=str(row[item_col]), rank=i + 1, score=float(row[sort_col]))
-                    for i, row in sorted_df.iterrows()
-                ]
-                return RankResult(order_id=order_id, rankings=rankings, n_responses=len(df))
-
-            sorted_items = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-            rankings = [
-                RankedItem(item=item, rank=i + 1, score=score)
-                for i, (item, score) in enumerate(sorted_items)
-            ]
-            return RankResult(
-                order_id=order_id,
-                rankings=rankings,
-                n_responses=total_votes or len(rankings),
-            )
+        return _parse_order_result(order_id, order.name, raw)
 
     return await run_sync(_fetch)  # type: ignore[return-value]
+
+
+async def get_preliminary_results(order_id: str) -> Result | None:
+    """
+    Fetch partial results while the order is still collecting responses.
+
+    Returns None if no data is available yet. For rank orders, always returns None
+    (rank results are only meaningful when complete).
+    """
+    def _fetch() -> Result | None:
+        client = get_client()
+        order = client.order.get_order_by_id(order_id)
+        if order.name.startswith("rnk::"):
+            return None
+        try:
+            raw = order.get_results(preliminary_results=True)
+            result = _parse_order_result(order_id, order.name, raw)
+            if result.n_responses == 0:
+                return None
+            return result
+        except Exception:
+            return None
+
+    return await run_sync(_fetch)
 
 
 async def ask_clarifying_question(question: str, options: list[str]) -> str:

@@ -35,6 +35,7 @@ class FreeTextResult(BaseModel):
     order_type: Literal["free_text"] = "free_text"
     responses: list[str]
     n_responses: int
+    country_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class MultipleChoiceResult(BaseModel):
@@ -44,6 +45,7 @@ class MultipleChoiceResult(BaseModel):
     distribution: dict[str, int]
     confidence: float
     n_responses: int
+    country_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class CompareResult(BaseModel):
@@ -55,6 +57,7 @@ class CompareResult(BaseModel):
     option_b_votes: int
     confidence: float
     n_responses: int
+    country_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class RankedItem(BaseModel):
@@ -68,6 +71,7 @@ class RankResult(BaseModel):
     order_type: Literal["rank"] = "rank"
     rankings: list[RankedItem]
     n_responses: int
+    country_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class ProgressResult(BaseModel):
@@ -125,6 +129,17 @@ class OrderCompleteEvent(BaseModel):
     distribution: dict[str, int] | None = None
     winner: str | None = None
     n_responses: int
+    country_counts: dict[str, int] = Field(default_factory=dict)
+
+
+class OrderPartialResultsEvent(BaseModel):
+    """Preliminary results while the order is still collecting responses."""
+    event: Literal["order_partial_results"] = "order_partial_results"
+    order_id: str
+    distribution: dict[str, int] | None = None
+    winner: str | None = None
+    n_responses: int
+    country_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class BriefSection(BaseModel):
@@ -157,6 +172,7 @@ SSEEvent = Annotated[
     | OrderDispatchedEvent
     | OrderProgressEvent
     | OrderCompleteEvent
+    | OrderPartialResultsEvent
     | BriefUpdateEvent
     | DoneEvent,
     Field(discriminator="event"),

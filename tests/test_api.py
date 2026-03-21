@@ -26,6 +26,7 @@ from human_use.models import (
     Gender,
     OrderCompleteEvent,
     OrderDispatchedEvent,
+    OrderPartialResultsEvent,
     OrderProgressEvent,
     ResearchBrief,
     SSEEvent,
@@ -222,7 +223,8 @@ async def test_sse_endpoint_emits_correct_event_sequence(
     event_types = [e["event"] for e in events]
     assert "agent_thought" in event_types
     assert "order_dispatched" in event_types
-    assert "order_progress" in event_types
+    # With preliminary results available, order_partial_results replaces order_progress
+    assert any(e in event_types for e in ("order_progress", "order_partial_results"))
     assert "order_complete" in event_types
     assert "brief_update" in event_types
     assert "done" in event_types
@@ -272,6 +274,7 @@ async def test_each_event_deserializes_into_correct_typed_model(
         "agent_thought": AgentThoughtEvent,
         "order_dispatched": OrderDispatchedEvent,
         "order_progress": OrderProgressEvent,
+        "order_partial_results": OrderPartialResultsEvent,
         "order_complete": OrderCompleteEvent,
         "brief_update": BriefUpdateEvent,
         "done": DoneEvent,
@@ -602,7 +605,9 @@ async def test_event_sequence_order_is_correct(mock_rapidata: MagicMock) -> None
     idx_dispatched = event_types.index("order_dispatched")
     assert idx_thought < idx_dispatched
 
-    idx_progress = event_types.index("order_progress")
+    # Either order_progress or order_partial_results appears between dispatch and complete
+    progress_types = {"order_progress", "order_partial_results"}
+    idx_progress = next(i for i, e in enumerate(event_types) if e in progress_types)
     assert idx_dispatched < idx_progress
 
     idx_complete = event_types.index("order_complete")

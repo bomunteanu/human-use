@@ -108,6 +108,21 @@ async def get_session_with_messages(
     return session, list(result.all())
 
 
+async def rename_session(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    user_id: uuid.UUID,
+    title: str,
+) -> bool:
+    session = await db.get(Session, session_id)
+    if session is None or session.user_id != user_id:
+        return False
+    session.title = title[:60]
+    db.add(session)
+    await db.commit()
+    return True
+
+
 async def delete_session(
     db: AsyncSession,
     session_id: uuid.UUID,

@@ -69,6 +69,16 @@ export interface OrderCompleteEvent {
   distribution: Record<string, number> | null;
   winner: string | null;
   n_responses: number;
+  country_counts: Record<string, number>;
+}
+
+export interface OrderPartialResultsEvent {
+  event: "order_partial_results";
+  order_id: string;
+  distribution: Record<string, number> | null;
+  winner: string | null;
+  n_responses: number;
+  country_counts: Record<string, number>;
 }
 
 export interface BriefSection {
@@ -101,6 +111,7 @@ export type SSEEvent =
   | OrderDispatchedEvent
   | OrderProgressEvent
   | OrderCompleteEvent
+  | OrderPartialResultsEvent
   | BriefUpdateEvent
   | DoneEvent;
 
@@ -113,6 +124,7 @@ export interface OrderState {
   distribution: Record<string, number> | null;
   winner: string | null;
   n_responses: number | null;
+  country_counts: Record<string, number>;
 }
 
 // ─── Chat message union ───────────────────────────────────────────────────────

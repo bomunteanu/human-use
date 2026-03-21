@@ -1,5 +1,5 @@
-import { useEffect } from "react";
-import { PenLine, Clock, Search, LogOut, FileText } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { PenLine, Clock, Search, LogOut, FileText, Trash2, Pencil, Check, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useResearchContext } from "../context/ResearchContext";
 import { useStore } from "../store";
@@ -9,6 +9,8 @@ export function Sidebar() {
   const { dispatch } = useResearchContext();
   const fetchSessions = useStore((s) => s.fetchSessions);
   const loadSession = useStore((s) => s.loadSession);
+  const deleteSession = useStore((s) => s.deleteSession);
+  const renameSession = useStore((s) => s.renameSession);
   const sessionHistory = useStore((s) => s.sessionHistory);
   const isLoadingSessions = useStore((s) => s.isLoadingSessions);
   const currentSessionId = useStore((s) => s.sessionId);
@@ -16,12 +18,39 @@ export function Sidebar() {
   const completedCount = sessionHistory.filter((s) => s.brief !== null).length;
   const { logout } = useAuth();
 
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+  const editInputRef = useRef<HTMLInputElement>(null);
+
   useEffect(() => {
     fetchSessions();
   }, [fetchSessions]);
 
+  useEffect(() => {
+    if (editingId) editInputRef.current?.focus();
+  }, [editingId]);
+
   const handleNewResearch = () => {
     dispatch({ type: "RESET" });
+  };
+
+  const startRename = (e: React.MouseEvent, id: string, title: string) => {
+    e.stopPropagation();
+    setEditingId(id);
+    setEditingTitle(title);
+  };
+
+  const commitRename = async () => {
+    if (!editingId || !editingTitle.trim()) { setEditingId(null); return; }
+    await renameSession(editingId, editingTitle.trim());
+    setEditingId(null);
+  };
+
+  const cancelRename = () => setEditingId(null);
+
+  const handleRenameKey = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") commitRename();
+    if (e.key === "Escape") cancelRename();
   };
 
   return (
@@ -85,31 +114,83 @@ export function Sidebar() {
         )}
 
         {sessionHistory.map((item) => (
-          <button
+          <div
             key={item.id}
-            onClick={() => loadSession(item.id)}
-            className={`w-full text-left px-2 py-2 rounded-[6px] group hover:bg-[#21262d] transition-colors ${
-              currentSessionId === item.id ? "bg-[#21262d]" : ""
+            className={`group relative w-full rounded-[6px] transition-colors ${
+              currentSessionId === item.id ? "bg-[#21262d]" : "hover:bg-[#21262d]"
             }`}
           >
-            <div className="flex items-start gap-2">
-              <Search size={12} className="text-[#7d8590] mt-0.5 flex-shrink-0" />
-              <div className="min-w-0 flex-1">
-                <p className="text-[12px] text-[#e6edf3] leading-snug truncate">
-                  {item.title}
-                </p>
-                <p className="text-[11px] text-[#7d8590] mt-0.5">
-                  {new Date(item.created_at).toLocaleDateString("en-US", {
-                    month: "short",
-                    day: "numeric",
-                  })}
-                </p>
+            {editingId === item.id ? (
+              /* ── Inline rename mode ── */
+              <div className="flex items-center gap-1 px-2 py-2">
+                <Search size={12} className="text-[#7d8590] flex-shrink-0" />
+                <input
+                  ref={editInputRef}
+                  value={editingTitle}
+                  onChange={(e) => setEditingTitle(e.target.value)}
+                  onKeyDown={handleRenameKey}
+                  onBlur={commitRename}
+                  className="flex-1 min-w-0 bg-[#0d1117] border border-[#58a6ff] rounded px-1.5 py-0.5 text-[12px] text-[#e6edf3] outline-none"
+                />
+                <button
+                  onMouseDown={(e) => { e.preventDefault(); commitRename(); }}
+                  className="text-[#3fb950] hover:text-[#56d364] flex-shrink-0"
+                >
+                  <Check size={12} />
+                </button>
+                <button
+                  onMouseDown={(e) => { e.preventDefault(); cancelRename(); }}
+                  className="text-[#7d8590] hover:text-[#e6edf3] flex-shrink-0"
+                >
+                  <X size={12} />
+                </button>
               </div>
-              {item.brief && (
-                <FileText size={10} className="text-[#58a6ff] mt-1 flex-shrink-0" />
-              )}
-            </div>
-          </button>
+            ) : (
+              /* ── Normal row ── */
+              <button
+                onClick={() => loadSession(item.id)}
+                className="w-full text-left px-2 py-2"
+              >
+                <div className="flex items-start gap-2">
+                  <Search size={12} className="text-[#7d8590] mt-0.5 flex-shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[12px] text-[#e6edf3] leading-snug truncate pr-10">
+                      {item.title}
+                    </p>
+                    <p className="text-[11px] text-[#7d8590] mt-0.5">
+                      {new Date(item.created_at).toLocaleDateString("en-US", {
+                        month: "short",
+                        day: "numeric",
+                      })}
+                    </p>
+                  </div>
+                  {item.brief && (
+                    <FileText size={10} className="text-[#58a6ff] mt-1 flex-shrink-0" />
+                  )}
+                </div>
+              </button>
+            )}
+
+            {/* Action buttons — visible on hover when not editing */}
+            {editingId !== item.id && (
+              <div className="absolute right-1.5 top-1/2 -translate-y-1/2 hidden group-hover:flex items-center gap-0.5">
+                <button
+                  onClick={(e) => startRename(e, item.id, item.title)}
+                  title="Rename"
+                  className="p-1 text-[#7d8590] hover:text-[#e6edf3] hover:bg-[#30363d] rounded transition-colors"
+                >
+                  <Pencil size={11} />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); deleteSession(item.id); }}
+                  title="Delete"
+                  className="p-1 text-[#7d8590] hover:text-[#f85149] hover:bg-[#30363d] rounded transition-colors"
+                >
+                  <Trash2 size={11} />
+                </button>
+              </div>
+            )}
+          </div>
         ))}
       </div>
     </div>

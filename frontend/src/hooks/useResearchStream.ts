@@ -35,6 +35,7 @@ function applyEvent(prev: StreamState, evt: SSEEvent): StreamState {
       distribution: null,
       winner: null,
       n_responses: null,
+      country_counts: {},
     });
     next.orders = orders;
   } else if (evt.event === "order_progress") {

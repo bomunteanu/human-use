@@ -11,6 +11,7 @@ import {
 import { Loader2 } from "lucide-react";
 import { useResearchContext } from "../context/ResearchContext";
 import type { SurveyResult } from "../types";
+import { WorldMap } from "./WorldMap";
 
 interface Props {
   message: SurveyResult;
@@ -30,7 +31,7 @@ export function SurveyResultCard({ message }: Props) {
   const capturedRef = useRef(false);
 
   useEffect(() => {
-    if (!order.distribution || capturedRef.current) return;
+    if (!order.distribution || !order.is_complete || capturedRef.current) return;
 
     let cancelled = false;
 
@@ -79,7 +80,7 @@ export function SurveyResultCard({ message }: Props) {
 
     attempt(10);
     return () => { cancelled = true; };
-  }, [order.distribution, order.order_id, setChartCapture]);
+  }, [order.distribution, order.is_complete, order.order_id, setChartCapture]);
 
   return (
     <div className="flex justify-start px-4 py-1">
@@ -106,10 +107,10 @@ export function SurveyResultCard({ message }: Props) {
           {/* Question */}
           <p className="text-[13px] text-[#e6edf3] leading-snug">{order.question}</p>
 
-          {order.is_complete ? (
+          {order.distribution ? (
             <>
-              {/* Winner badge */}
-              {order.winner && (
+              {/* Winner badge — only when complete */}
+              {order.is_complete && order.winner && (
                 <div className="flex items-center gap-2">
                   <span className="text-[11px] text-[#7d8590]">Top response:</span>
                   <span className="text-[12px] font-medium text-[#3fb950] bg-[#3fb950]/10 px-2 py-0.5 rounded-full">
@@ -118,44 +119,47 @@ export function SurveyResultCard({ message }: Props) {
                 </div>
               )}
 
-              {/* Chart */}
-              {order.distribution ? (
-                <div ref={containerRef}>
-                  <ResponsiveContainer width="100%" height={110}>
-                    <BarChart
-                      data={Object.entries(order.distribution).map(([name, value]) => ({ name, value }))}
-                      margin={{ top: 4, right: 4, left: -20, bottom: 0 }}
-                    >
-                      <XAxis dataKey="name" tick={{ fill: "#7d8590", fontSize: 11 }} />
-                      <YAxis tick={{ fill: "#7d8590", fontSize: 11 }} />
-                      <Tooltip
-                        contentStyle={{
-                          background: "#0d1117",
-                          border: "1px solid #21262d",
-                          borderRadius: 4,
-                          fontSize: 12,
-                        }}
-                        labelStyle={{ color: "#e6edf3" }}
-                      />
-                      <Bar dataKey="value" radius={[3, 3, 0, 0]}>
-                        {Object.keys(order.distribution).map((name, i) => (
-                          <Cell
-                            key={i}
-                            fill={name === order.winner ? "#3fb950" : "#2f81f7"}
-                          />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              ) : (
-                <p className="text-[12px] text-[#7d8590]">
-                  {order.n_responses != null ? `${order.n_responses} responses collected` : "Complete"}
-                </p>
+              {/* Live chart — shown as soon as any data arrives */}
+              <div ref={containerRef}>
+                <ResponsiveContainer width="100%" height={110}>
+                  <BarChart
+                    data={Object.entries(order.distribution).map(([name, value]) => ({ name, value }))}
+                    margin={{ top: 4, right: 4, left: -20, bottom: 0 }}
+                  >
+                    <XAxis dataKey="name" tick={{ fill: "#7d8590", fontSize: 11 }} />
+                    <YAxis tick={{ fill: "#7d8590", fontSize: 11 }} />
+                    <Tooltip
+                      contentStyle={{
+                        background: "#0d1117",
+                        border: "1px solid #21262d",
+                        borderRadius: 4,
+                        fontSize: 12,
+                      }}
+                      labelStyle={{ color: "#e6edf3" }}
+                    />
+                    <Bar dataKey="value" radius={[3, 3, 0, 0]} isAnimationActive={!order.is_complete}>
+                      {Object.keys(order.distribution).map((name, i) => (
+                        <Cell
+                          key={i}
+                          fill={name === order.winner ? "#3fb950" : "#2f81f7"}
+                        />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+
+              {/* "Still collecting" note while in progress */}
+              {!order.is_complete && (
+                <p className="text-[11px] text-[#7d8590]">Still collecting responses…</p>
               )}
             </>
+          ) : order.is_complete ? (
+            <p className="text-[12px] text-[#7d8590]">
+              {order.n_responses != null ? `${order.n_responses} responses collected` : "Complete"}
+            </p>
           ) : (
-            /* In-progress skeleton */
+            /* In-progress skeleton — shown before first data arrives */
             <div className="space-y-1.5 py-1">
               <div className="h-1.5 rounded-full bg-[#21262d] overflow-hidden">
                 <div className="h-full w-1/2 bg-[#2f81f7] rounded-full animate-pulse" />
@@ -163,6 +167,9 @@ export function SurveyResultCard({ message }: Props) {
               <p className="text-[11px] text-[#7d8590]">Collecting responses from real people…</p>
             </div>
           )}
+
+          {/* World map — always shown once survey is dispatched, lights up as responses arrive */}
+          <WorldMap countryCounts={order.country_counts ?? {}} />
         </div>
       </div>
     </div>

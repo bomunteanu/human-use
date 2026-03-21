@@ -67,6 +67,8 @@ export interface ResearchStore {
   // ─── Session history actions ───────────────────────────────────────────────
   fetchSessions: () => Promise<void>;
   loadSession: (sessionId: string) => Promise<void>;
+  deleteSession: (sessionId: string) => Promise<void>;
+  renameSession: (sessionId: string, title: string) => Promise<void>;
   openArtifacts: () => void;
   closeArtifacts: () => void;
 }
@@ -272,6 +274,7 @@ export const useStore = create<ResearchStore>((set, get) => ({
             distribution: null,
             winner: null,
             n_responses: null,
+            country_counts: {},
           });
         }
       }
@@ -360,6 +363,7 @@ export const useStore = create<ResearchStore>((set, get) => ({
                 distribution: null,
                 winner: null,
                 n_responses: null,
+                country_counts: {},
               };
               const surveyMsg: SurveyResult = {
                 id: crypto.randomUUID(),
@@ -542,6 +546,35 @@ export const useStore = create<ResearchStore>((set, get) => ({
 
   openPdfPanel: () => set({ isPdfPanelOpen: true }),
   closePdfPanel: () => set({ isPdfPanelOpen: false }),
+  deleteSession: async (sessionId) => {
+    const { authToken } = get();
+    if (!authToken) return;
+    await fetch(`http://localhost:8000/sessions/${sessionId}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    set((s) => ({ sessionHistory: s.sessionHistory.filter((h) => h.id !== sessionId) }));
+    // If the deleted session is currently loaded, reset the chat
+    if (get().sessionId === sessionId) {
+      get().reset();
+    }
+  },
+
+  renameSession: async (sessionId, title) => {
+    const { authToken } = get();
+    if (!authToken) return;
+    await fetch(`http://localhost:8000/sessions/${sessionId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
+      body: JSON.stringify({ title }),
+    });
+    set((s) => ({
+      sessionHistory: s.sessionHistory.map((h) =>
+        h.id === sessionId ? { ...h, title } : h,
+      ),
+    }));
+  },
+
   openArtifacts: () => set({ isArtifactsOpen: true }),
   closeArtifacts: () => set({ isArtifactsOpen: false }),
 
@@ -608,6 +641,7 @@ export const useStore = create<ResearchStore>((set, get) => ({
         distribution: null,
         winner: null,
         n_responses: null,
+        country_counts: {},
       };
       const msg: SurveyResult = {
         id: crypto.randomUUID(),
@@ -641,6 +675,30 @@ export const useStore = create<ResearchStore>((set, get) => ({
       return;
     }
 
+    if (evt.event === "order_partial_results") {
+      set((s) => {
+        const existing = s.orders.get(evt.order_id);
+        if (!existing) return s;
+        const updated: OrderState = {
+          ...existing,
+          distribution: evt.distribution,
+          winner: evt.winner,
+          n_responses: evt.n_responses,
+          country_counts: evt.country_counts ?? {},
+          // is_complete stays false — order is still collecting
+        };
+        const orders = new Map(s.orders);
+        orders.set(evt.order_id, updated);
+        const chatMessages = s.chatMessages.map((m) =>
+          m.type === "survey_result" && m.order.order_id === evt.order_id
+            ? { ...m, order: updated }
+            : m,
+        );
+        return { orders, chatMessages };
+      });
+      return;
+    }
+
     if (evt.event === "order_complete") {
       set((s) => {
         const existing = s.orders.get(evt.order_id);
@@ -650,11 +708,13 @@ export const useStore = create<ResearchStore>((set, get) => ({
             tool: "unknown",
             question: "",
             status: "complete",
+            country_counts: {},
           }),
           is_complete: true,
           distribution: evt.distribution,
           winner: evt.winner,
           n_responses: evt.n_responses,
+          country_counts: evt.country_counts ?? {},
         };
         const orders = new Map(s.orders);
         orders.set(evt.order_id, updated);
