@@ -25,7 +25,7 @@ from human_use.models import (
     RankResult,
 )
 
-RESPONSES_PER_DATAPOINT = 10
+RESPONSES_PER_DATAPOINT = 50
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +194,7 @@ def test_compare_n_greater_than_10_creates_multiple_pairs(mock_rapidata):
     order = make_order("cmp::Q")
     mock_rapidata.order.create_compare_order.return_value = order
 
-    asyncio.run(tools.compare("Q", "A", "B", n=30))
+    asyncio.run(tools.compare("Q", "A", "B", n=150))
 
     _, kwargs = mock_rapidata.order.create_compare_order.call_args
     assert len(kwargs["datapoints"]) == 3

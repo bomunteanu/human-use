@@ -1,3 +1,19 @@
+// ─── Demographic targeting types ─────────────────────────────────────────────
+
+export type AgeGroup = "under_18" | "18-24" | "25-34" | "35-44" | "45-54" | "55+";
+export type Gender = "male" | "female" | "other";
+
+export interface TargetingConfig {
+  country_codes: string[];
+  languages: string[];
+  age_groups: AgeGroup[];
+  genders: Gender[];
+}
+
+export function emptyTargeting(): TargetingConfig {
+  return { country_codes: [], languages: [], age_groups: [], genders: [] };
+}
+
 // ─── Anthropic conversation history types ────────────────────────────────────
 
 export type AnthropicContentBlock =
@@ -23,6 +39,14 @@ export interface ClarifyingQuestionEvent {
 export interface AgentThoughtEvent {
   event: "agent_thought";
   text: string;
+}
+
+export interface TargetingUpdateEvent {
+  event: "targeting_update";
+  country_codes: string[];
+  languages: string[];
+  age_groups: AgeGroup[];
+  genders: Gender[];
 }
 
 export interface OrderDispatchedEvent {
@@ -73,6 +97,7 @@ export interface DoneEvent {
 export type SSEEvent =
   | ClarifyingQuestionEvent
   | AgentThoughtEvent
+  | TargetingUpdateEvent
   | OrderDispatchedEvent
   | OrderProgressEvent
   | OrderCompleteEvent

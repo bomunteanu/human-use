@@ -5,7 +5,7 @@
  */
 import type { ReactNode } from "react";
 import { useStore, type ResearchStore } from "../store";
-import type { BriefSection, ChatMessage, OrderState, ResearchBrief } from "../types";
+import type { BriefSection, ChatMessage, OrderState, ResearchBrief, TargetingConfig } from "../types";
 
 // ─── Legacy state shape (kept for component compatibility) ────────────────────
 
@@ -33,7 +33,7 @@ export type ResearchAction =
 interface ResearchContextValue {
   state: ResearchState;
   dispatch: (action: ResearchAction) => void;
-  startResearch: ResearchStore["startResearch"];
+  startResearch: (question: string, targeting?: TargetingConfig) => void;
   stopResearch: ResearchStore["stopResearch"];
   submitAnswer: ResearchStore["submitAnswer"];
   setChartCapture: ResearchStore["setChartCapture"];

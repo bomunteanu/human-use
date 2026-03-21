@@ -1,14 +1,33 @@
 from __future__ import annotations
 
+from enum import Enum
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
 
-class TargetingConfig(BaseModel):
-    """Geographic targeting for Rapidata orders. Empty country_codes means Worldwide."""
+class AgeGroup(str, Enum):
+    UNDER_18 = "under_18"
+    AGE_18_24 = "18-24"
+    AGE_25_34 = "25-34"
+    AGE_35_44 = "35-44"
+    AGE_45_54 = "45-54"
+    AGE_55_PLUS = "55+"
 
-    country_codes: list[str]  # ISO 3166-1 alpha-2 codes; empty = no filter
+
+class Gender(str, Enum):
+    MALE = "male"
+    FEMALE = "female"
+    OTHER = "other"
+
+
+class TargetingConfig(BaseModel):
+    """Full demographic targeting for Rapidata orders. All empty = Worldwide / all demographics."""
+
+    country_codes: list[str] = []  # ISO 3166-1 alpha-2; empty = no filter
+    languages: list[str] = []      # ISO 639-1; empty = all languages
+    age_groups: list[AgeGroup] = []  # empty = all ages
+    genders: list[Gender] = []       # empty = all genders
 
 
 class FreeTextResult(BaseModel):
@@ -78,6 +97,14 @@ class AgentThoughtEvent(BaseModel):
     text: str
 
 
+class TargetingUpdateEvent(BaseModel):
+    event: Literal["targeting_update"] = "targeting_update"
+    country_codes: list[str]
+    languages: list[str]
+    age_groups: list[str]
+    genders: list[str]
+
+
 class OrderDispatchedEvent(BaseModel):
     event: Literal["order_dispatched"] = "order_dispatched"
     order_id: str
@@ -126,6 +153,7 @@ class DoneEvent(BaseModel):
 SSEEvent = Annotated[
     ClarifyingQuestionEvent
     | AgentThoughtEvent
+    | TargetingUpdateEvent
     | OrderDispatchedEvent
     | OrderProgressEvent
     | OrderCompleteEvent

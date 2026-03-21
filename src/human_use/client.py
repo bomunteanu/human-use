@@ -15,10 +15,14 @@ _client: RapidataClient | None = None
 def get_client() -> RapidataClient:
     global _client
     if _client is None:
-        _client = RapidataClient(
-            client_id=os.environ["RAPIDATA_CLIENT_ID"],
-            client_secret=os.environ["RAPIDATA_CLIENT_SECRET"],
-        )
+        try:
+            _client = RapidataClient(
+                client_id=os.environ["RAPIDATA_CLIENT_ID"],
+                client_secret=os.environ["RAPIDATA_CLIENT_SECRET"],
+            )
+        except Exception:
+            _client = None  # don't cache a broken client
+            raise
     return _client
 
 

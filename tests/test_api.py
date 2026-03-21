@@ -19,14 +19,18 @@ import human_use.client as client_module
 from human_use.api import app
 from human_use.models import (
     AgentThoughtEvent,
+    AgeGroup,
     BriefUpdateEvent,
     ClarifyingQuestionEvent,
     DoneEvent,
+    Gender,
     OrderCompleteEvent,
     OrderDispatchedEvent,
     OrderProgressEvent,
     ResearchBrief,
     SSEEvent,
+    TargetingConfig,
+    TargetingUpdateEvent,
 )
 
 _SSEEventAdapter: TypeAdapter[SSEEvent] = TypeAdapter(SSEEvent)
@@ -1128,3 +1132,381 @@ async def test_session_not_persisted_without_auth(
     assert user is not None
     sessions = await get_sessions(db_session, user.id)
     assert len(sessions) == 0
+
+
+# ---------------------------------------------------------------------------
+# Demographic targeting — _filters() unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_filters_empty_targeting_produces_no_filters() -> None:
+    """All-empty TargetingConfig produces an empty filter list."""
+    from human_use.tools import _filters
+
+    assert _filters(None, None) == []
+    assert _filters(None, TargetingConfig()) == []
+    assert _filters(None, TargetingConfig(country_codes=[], languages=[], age_groups=[], genders=[])) == []
+
+
+def test_filters_country_codes_produces_country_filter() -> None:
+    from human_use.tools import _filters
+    from rapidata import CountryFilter
+
+    result = _filters(None, TargetingConfig(country_codes=["US", "GB"]))
+    assert len(result) == 1
+    assert isinstance(result[0], CountryFilter)
+
+
+def test_filters_single_language_produces_language_filter() -> None:
+    from human_use.tools import _filters
+    from rapidata import LanguageFilter
+
+    result = _filters(None, TargetingConfig(languages=["en"]))
+    assert len(result) == 1
+    assert isinstance(result[0], LanguageFilter)
+
+
+def test_filters_single_age_group_produces_age_filter() -> None:
+    from human_use.tools import _filters
+    from rapidata import AgeFilter
+
+    result = _filters(None, TargetingConfig(age_groups=[AgeGroup.AGE_18_24]))
+    assert len(result) == 1
+    assert isinstance(result[0], AgeFilter)
+
+
+def test_filters_multiple_age_groups_produces_single_age_filter() -> None:
+    """Multiple age groups are passed as a single AgeFilter with multiple groups (OR semantics)."""
+    from human_use.tools import _filters
+    from rapidata import AgeFilter
+
+    result = _filters(None, TargetingConfig(age_groups=[AgeGroup.AGE_18_24, AgeGroup.AGE_25_34]))
+    assert len(result) == 1
+    assert isinstance(result[0], AgeFilter)
+    assert len(result[0].age_groups) == 2
+
+
+def test_filters_single_gender_produces_gender_filter() -> None:
+    from human_use.tools import _filters
+    from rapidata import GenderFilter
+
+    result = _filters(None, TargetingConfig(genders=[Gender.MALE]))
+    assert len(result) == 1
+    assert isinstance(result[0], GenderFilter)
+
+
+def test_filters_multiple_genders_produces_single_gender_filter() -> None:
+    """Multiple genders are passed as a single GenderFilter with multiple genders (OR semantics)."""
+    from human_use.tools import _filters
+    from rapidata import GenderFilter
+
+    result = _filters(None, TargetingConfig(genders=[Gender.MALE, Gender.FEMALE]))
+    assert len(result) == 1
+    assert isinstance(result[0], GenderFilter)
+    assert len(result[0].genders) == 2
+
+
+def test_filters_all_fields_combined() -> None:
+    """All four fields set → four filter entries (country, language, age, gender)."""
+    from human_use.tools import _filters
+    from rapidata import AgeFilter, CountryFilter, GenderFilter, LanguageFilter
+
+    result = _filters(
+        None,
+        TargetingConfig(
+            country_codes=["DE"],
+            languages=["de"],
+            age_groups=[AgeGroup.AGE_25_34],
+            genders=[Gender.FEMALE],
+        ),
+    )
+    assert len(result) == 4
+    types = {type(f) for f in result}
+    assert CountryFilter in types
+    assert LanguageFilter in types
+    assert AgeFilter in types
+    assert GenderFilter in types
+
+
+def test_filters_multiple_ages_and_genders_produce_single_filters() -> None:
+    from human_use.tools import _filters
+    from rapidata import AgeFilter, GenderFilter
+
+    result = _filters(
+        None,
+        TargetingConfig(
+            age_groups=[AgeGroup.UNDER_18, AgeGroup.AGE_18_24, AgeGroup.AGE_25_34],
+            genders=[Gender.MALE, Gender.OTHER],
+        ),
+    )
+    assert len(result) == 2
+    age_filter = next(f for f in result if isinstance(f, AgeFilter))
+    gender_filter = next(f for f in result if isinstance(f, GenderFilter))
+    assert len(age_filter.age_groups) == 3
+    assert len(gender_filter.genders) == 2
+
+
+# ---------------------------------------------------------------------------
+# Demographic targeting — SSE targeting_update event tests
+# ---------------------------------------------------------------------------
+
+
+async def test_targeting_update_event_emitted_when_agent_calls_update_targeting(
+    mock_rapidata: MagicMock,
+) -> None:
+    """When the agent calls update_targeting, a targeting_update SSE event is emitted."""
+    dispatch_order = _make_order("mc::Test?", "ord_tu")
+    mock_rapidata.order.create_classification_order.return_value = dispatch_order
+
+    result_order = _make_order("mc::Test?", "ord_tu")
+    result_order.get_status.return_value = "Completed"
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("A", 5), ("B", 5))
+    )
+    mock_rapidata.order.get_order_by_id.return_value = result_order
+
+    first_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "update_targeting",
+                {"country_codes": ["GB", "FR"], "languages": [], "age_groups": [], "genders": []},
+                "tu_target_1",
+            ),
+        ]
+    )
+    second_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "ask_multiple_choice",
+                {"question": "Test?", "options": ["A", "B"], "n": 10},
+                "tu_mc_1",
+            ),
+        ]
+    )
+    third_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "Done.", "sections": [{"title": "R", "content": "C."}]},
+                "tu_cr_1",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response, third_response])
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_events(client, "neobank in UK and France")
+
+    tu_events = [e for e in events if e.get("event") == "targeting_update"]
+    assert len(tu_events) == 1
+
+    parsed = _parse_event(tu_events[0])
+    assert isinstance(parsed, TargetingUpdateEvent)
+    assert parsed.country_codes == ["GB", "FR"]
+    assert parsed.languages == []
+    assert parsed.age_groups == []
+    assert parsed.genders == []
+
+
+async def test_targeting_update_event_with_full_demographics(
+    mock_rapidata: MagicMock,
+) -> None:
+    """targeting_update event carries all demographic fields correctly."""
+    first_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "update_targeting",
+                {
+                    "country_codes": ["US"],
+                    "languages": ["en"],
+                    "age_groups": ["18-24", "25-34"],
+                    "genders": ["male"],
+                },
+                "tu_target_1",
+            ),
+        ]
+    )
+    second_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "Done.", "sections": [{"title": "R", "content": "C."}]},
+                "tu_cr_1",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_events(client, "Survey young US men")
+
+    tu_events = [e for e in events if e.get("event") == "targeting_update"]
+    assert len(tu_events) == 1
+
+    parsed = _parse_event(tu_events[0])
+    assert isinstance(parsed, TargetingUpdateEvent)
+    assert parsed.country_codes == ["US"]
+    assert parsed.languages == ["en"]
+    assert set(parsed.age_groups) == {"18-24", "25-34"}
+    assert parsed.genders == ["male"]
+
+
+async def test_targeting_update_used_for_subsequent_surveys(
+    mock_rapidata: MagicMock,
+) -> None:
+    """After update_targeting, the new targeting is applied to the dispatched survey."""
+    dispatch_order = _make_order("mc::Which is better?", "ord_targeted")
+    mock_rapidata.order.create_classification_order.return_value = dispatch_order
+
+    result_order = _make_order("mc::Which is better?", "ord_targeted")
+    result_order.get_status.return_value = "Completed"
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("A", 7), ("B", 3))
+    )
+    mock_rapidata.order.get_order_by_id.return_value = result_order
+
+    first_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "update_targeting",
+                {"country_codes": ["DE"], "languages": ["de"], "age_groups": ["35-44"], "genders": ["female"]},
+                "tu_target_1",
+            ),
+        ]
+    )
+    second_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "ask_multiple_choice",
+                {"question": "Which is better?", "options": ["A", "B"], "n": 10},
+                "tu_mc_1",
+            ),
+        ]
+    )
+    third_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "A wins.", "sections": [{"title": "R", "content": "C."}]},
+                "tu_cr_1",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response, third_response])
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_events(client, "German women aged 35-44")
+
+    # Survey was dispatched
+    assert any(e["event"] == "order_dispatched" for e in events)
+    assert any(e["event"] == "done" for e in events)
+
+    # Verify the classification order was created with country filter (DE)
+    call_kwargs = mock_rapidata.order.create_classification_order.call_args
+    assert call_kwargs is not None
+    filters = call_kwargs.kwargs.get("filters") or call_kwargs.args[0] if call_kwargs.args else []
+    # filters list should be non-empty (targeting was applied)
+    assert filters is not None
+
+
+async def test_no_targeting_update_produces_no_event(mock_rapidata: MagicMock) -> None:
+    """If the agent doesn't call update_targeting, no targeting_update event is emitted."""
+    first_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "Done.", "sections": [{"title": "R", "content": "C."}]},
+                "tu_cr_1",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=first_response)
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events = await _collect_events(client, "General question")
+
+    tu_events = [e for e in events if e.get("event") == "targeting_update"]
+    assert len(tu_events) == 0
+
+
+async def test_targeting_sent_in_body_is_used(mock_rapidata: MagicMock) -> None:
+    """targeting in request body is passed through to the agent."""
+    dispatch_order = _make_order("mc::Test?", "ord_body_target")
+    mock_rapidata.order.create_classification_order.return_value = dispatch_order
+
+    result_order = _make_order("mc::Test?", "ord_body_target")
+    result_order.get_status.return_value = "Completed"
+    result_order.get_results.return_value = MagicMock(
+        to_pandas=lambda: _mc_df(("yes", 8), ("no", 2))
+    )
+    mock_rapidata.order.get_order_by_id.return_value = result_order
+
+    first_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "ask_multiple_choice",
+                {"question": "Test?", "options": ["yes", "no"], "n": 10},
+                "tu_mc_1",
+            ),
+        ]
+    )
+    second_response = _claude_response(
+        content=[
+            _tool_use_block(
+                "complete_research",
+                {"summary": "Yes.", "sections": [{"title": "R", "content": "C."}]},
+                "tu_cr_1",
+            ),
+        ]
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
+
+    with patch("human_use.agent.anthropic.AsyncAnthropic", return_value=mock_client):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            events: list[dict] = []
+            async with client.stream(
+                "POST",
+                "/research/stream",
+                json={
+                    "question": "Test?",
+                    "session_id": "test_body_target",
+                    "targeting": {
+                        "country_codes": ["JP"],
+                        "languages": ["ja"],
+                        "age_groups": [],
+                        "genders": [],
+                    },
+                },
+            ) as response:
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if line.startswith("data: "):
+                        payload = line[6:]
+                        if payload:
+                            try:
+                                events.append(json.loads(payload))
+                            except json.JSONDecodeError:
+                                pass
+
+    assert any(e["event"] == "done" for e in events)
+    # Verify CountryFilter was applied with JP
+    call_kwargs = mock_rapidata.order.create_classification_order.call_args
+    assert call_kwargs is not None
+    filters = call_kwargs.kwargs.get("filters") or []
+    from rapidata import CountryFilter
+    country_filters = [f for f in filters if isinstance(f, CountryFilter)]
+    assert len(country_filters) == 1

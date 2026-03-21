@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -73,6 +73,7 @@ class ResearchRequest(BaseModel):
     question: str
     session_id: str
     messages: list[dict[str, object]] = Field(default_factory=list)
+    targeting: TargetingConfig | None = None
 
 
 class AnswerRequest(BaseModel):
@@ -89,13 +90,13 @@ class CompileRequest(BaseModel):
 @app.post("/research/stream")
 async def research_stream(
     body: ResearchRequest,
-    country_codes: list[str] = Query(default=[]),
     current_user: Annotated[User | None, Depends(get_optional_user)] = None,
     db: Annotated[AsyncSession, Depends(get_session)] = None,
 ) -> EventSourceResponse:
     question = body.question
     session_id = body.session_id
-    targeting = TargetingConfig(country_codes=country_codes) if country_codes else None
+    # Use targeting from body; None means use defaults (all-empty = Worldwide)
+    targeting = body.targeting if body.targeting is not None else None
     queue: asyncio.Queue[SSEEvent | None] = asyncio.Queue()
 
     async def answer_awaiter(question_index: int) -> str:

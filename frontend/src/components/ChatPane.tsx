@@ -1,17 +1,18 @@
-import { useState } from "react";
 import { ChatMessageList } from "./ChatMessageList";
 import { ChatInputBar } from "./ChatInputBar";
 import { useResearchContext } from "../context/ResearchContext";
+import { useStore } from "../store";
+import { useState } from "react";
 
 export function ChatPane() {
   const { state, startResearch, stopResearch, compileFindings, dispatch } = useResearchContext();
+  const { currentTargeting, setTargeting } = useStore();
   const [inputText, setInputText] = useState("");
-  const [countryCodes, setCountryCodes] = useState<string[]>([]);
 
   const handleSubmit = () => {
     const q = inputText.trim();
     if (!q || state.isStreaming) return;
-    startResearch(q, countryCodes);
+    startResearch(q, currentTargeting);
     setInputText("");
   };
 
@@ -77,8 +78,8 @@ export function ChatPane() {
       <ChatInputBar
         value={inputText}
         onChange={setInputText}
-        countryCodes={countryCodes}
-        onCountryCodesChange={setCountryCodes}
+        targeting={currentTargeting}
+        onTargetingChange={setTargeting}
         onSubmit={handleSubmit}
         onStop={stopResearch}
         onCompileFindings={handleCompileFindings}

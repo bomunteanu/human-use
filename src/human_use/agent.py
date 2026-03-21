@@ -8,11 +8,13 @@ import anthropic
 
 from human_use.models import (
     AgentThoughtEvent,
+    AgeGroup,
     BriefSection,
     BriefUpdateEvent,
     ClarifyingQuestionEvent,
     CompareResult,
     DoneEvent,
+    Gender,
     MultipleChoiceResult,
     OrderCompleteEvent,
     OrderDispatchedEvent,
@@ -20,6 +22,7 @@ from human_use.models import (
     ResearchBrief,
     SSEEvent,
     TargetingConfig,
+    TargetingUpdateEvent,
 )
 from human_use.tools import (
     ask_multiple_choice,
@@ -33,13 +36,56 @@ POLL_INTERVAL: float = 5.0
 MAX_SURVEYS: int = 1
 MAX_CLARIFICATIONS: int = 3
 
+_AGE_GROUP_VALUES = [ag.value for ag in AgeGroup]
+_GENDER_VALUES = [g.value for g in Gender]
+
 _DISPATCH_TOOLS: list[anthropic.types.ToolParam] = [
+    {
+        "name": "update_targeting",
+        "description": (
+            "Update demographic targeting for all subsequent surveys. "
+            "Call this as soon as you can infer any demographic constraint from the user's prompt "
+            "(e.g. 'neobank in UK' → country_codes=['GB']). "
+            "Emit this BEFORE asking clarifying questions or dispatching surveys. "
+            "Default is all-empty (Worldwide / all demographics) — only populate fields that "
+            "were explicitly stated or strongly implied by the user. Never guess demographics. "
+            "After calling this, ask at most ONE clarifying question about any remaining gaps "
+            "(e.g. 'Any specific age group, or should I target everyone?')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "country_codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "ISO 3166-1 alpha-2 country codes. Empty = Worldwide.",
+                },
+                "languages": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "ISO 639-1 language codes or full language names. Empty = all languages.",
+                },
+                "age_groups": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": _AGE_GROUP_VALUES},
+                    "description": "Age groups to target. Empty = all ages.",
+                },
+                "genders": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": _GENDER_VALUES},
+                    "description": "Genders to target. Empty = all genders.",
+                },
+            },
+            "required": [],
+        },
+    },
     {
         "name": "ask_clarifying_question",
         "description": (
             "Ask the user a clarifying multiple-choice question before dispatching surveys. "
             "Use this at most 3 times to understand the research goal better. "
-            "Always ask clarifying questions FIRST, then dispatch surveys."
+            "Always ask clarifying questions FIRST, then dispatch surveys. "
+            "For demographic gaps, always offer 'All / everyone' as the default option."
         ),
         "input_schema": {
             "type": "object",
@@ -160,11 +206,19 @@ _COMPILE_TOOL: list[anthropic.types.ToolParam] = [
 
 _SURVEY_TOOL_NAMES = {"ask_multiple_choice", "compare", "rank"}
 _CLARIFY_TOOL_NAMES = {"ask_clarifying_question"}
+_TARGETING_TOOL_NAMES = {"update_targeting"}
 
 
 class _AskClarifyingQuestionInput(TypedDict):
     question: str
     options: list[str]
+
+
+class _UpdateTargetingInput(TypedDict, total=False):
+    country_codes: list[str]
+    languages: list[str]
+    age_groups: list[str]
+    genders: list[str]
 
 
 class _AskMultipleChoiceInput(TypedDict):
@@ -270,6 +324,15 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "to gather data from real people, then synthesize the findings into a research brief. "
     "Be thorough but efficient.\n\n"
     "{continuation_note}"
+    "DEMOGRAPHIC TARGETING: Before asking clarifying questions or dispatching surveys, call "
+    "update_targeting if you can infer any demographic constraint from the user's prompt "
+    "(e.g. 'neobank in UK and France' → country_codes=['GB','FR']). "
+    "The DEFAULT is Worldwide / all demographics (all fields empty) — only populate fields "
+    "that were EXPLICITLY stated or STRONGLY implied by the user. NEVER guess or assume "
+    "demographics without clear evidence. After calling update_targeting (or if no targeting "
+    "can be inferred), ask at most ONE clarifying question about demographic gaps "
+    "(e.g. 'Any specific age group, or should I target everyone?'). "
+    "Always offer 'All / everyone' as a default option in demographic questions.\n\n"
     "STEP 1 — CLARIFY: Before dispatching any surveys, ask at most {max_clarifications} "
     "clarifying questions using ask_clarifying_question to better understand the research "
     "goal. You have {remaining_clarifications} clarifying questions remaining. "
@@ -317,10 +380,13 @@ async def _run_agent_inner(
     client = anthropic.AsyncAnthropic()
     surveys_dispatched: int = 0
     clarifications_dispatched: int = 0
+    # Mutable targeting — updated when the agent calls update_targeting
+    current_targeting: TargetingConfig = targeting or TargetingConfig()
 
     initial_content = (
         f"Research question: {question}\n\n"
-        "First ask any clarifying questions you need, then gather human intelligence "
+        "First infer any demographic targeting from the question and call update_targeting if needed, "
+        "then ask any clarifying questions you need, then gather human intelligence "
         "using the survey tools, then call complete_research with your findings."
     )
 
@@ -424,6 +490,71 @@ async def _run_agent_inner(
                 await queue.put(None)
                 return
 
+            if block.name in _TARGETING_TOOL_NAMES:
+                inp_t = cast(_UpdateTargetingInput, block.input)
+                raw_age_groups = inp_t.get("age_groups", [])
+                raw_genders = inp_t.get("genders", [])
+
+                # Parse and validate enums; silently drop unknown values
+                valid_ages: list[AgeGroup] = []
+                for ag in raw_age_groups:
+                    try:
+                        valid_ages.append(AgeGroup(ag))
+                    except ValueError:
+                        pass
+
+                valid_genders: list[Gender] = []
+                for g in raw_genders:
+                    try:
+                        valid_genders.append(Gender(g))
+                    except ValueError:
+                        pass
+
+                current_targeting = TargetingConfig(
+                    country_codes=list(inp_t.get("country_codes", [])),
+                    languages=list(inp_t.get("languages", [])),
+                    age_groups=valid_ages,
+                    genders=valid_genders,
+                )
+
+                await queue.put(
+                    TargetingUpdateEvent(
+                        country_codes=current_targeting.country_codes,
+                        languages=current_targeting.languages,
+                        age_groups=[ag.value for ag in current_targeting.age_groups],
+                        genders=[g.value for g in current_targeting.genders],
+                    )
+                )
+
+                # Emit an agent_thought confirming the targeting change
+                parts: list[str] = []
+                if current_targeting.country_codes:
+                    parts.append(f"Countries: {', '.join(current_targeting.country_codes)}")
+                else:
+                    parts.append("Worldwide")
+                if current_targeting.languages:
+                    parts.append(f"Languages: {', '.join(current_targeting.languages)}")
+                else:
+                    parts.append("all languages")
+                if current_targeting.age_groups:
+                    parts.append(f"Ages: {', '.join(ag.value for ag in current_targeting.age_groups)}")
+                else:
+                    parts.append("all ages")
+                if current_targeting.genders:
+                    parts.append(f"Gender: {', '.join(g.value for g in current_targeting.genders)}")
+                else:
+                    parts.append("all genders")
+                await queue.put(AgentThoughtEvent(text=f"Targeting updated: {' · '.join(parts)}."))
+
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": "Targeting updated successfully.",
+                    }
+                )
+                continue
+
             if block.name in _CLARIFY_TOOL_NAMES:
                 if clarifications_dispatched >= MAX_CLARIFICATIONS:
                     tool_results.append(
@@ -491,7 +622,7 @@ async def _run_agent_inner(
                 continue
 
             surveys_dispatched += 1
-            order_id = await _dispatch(block.name, block.input, targeting)
+            order_id = await _dispatch(block.name, block.input, current_targeting)
             question_text = str(
                 cast(dict[str, object], block.input).get("question", "")
             )

@@ -93,18 +93,47 @@ Dispatch tools return immediately. Fetch results separately.
 
 `ask_multiple_choice` silently caps `options` to 8 (Rapidata API limit). The tool schema also declares `maxItems: 8` to discourage the LLM from exceeding the limit.
 
-## Geographic Targeting
+## Demographic Targeting
 
 All dispatch tools accept an optional `targeting: TargetingConfig` argument. `TargetingConfig` is defined in `models.py`:
 
 ```python
+class AgeGroup(str, Enum):
+    UNDER_18 = "under_18"
+    AGE_18_24 = "18-24"
+    AGE_25_34 = "25-34"
+    AGE_35_44 = "35-44"
+    AGE_45_54 = "45-54"
+    AGE_55_PLUS = "55+"
+
+class Gender(str, Enum):
+    MALE = "male"
+    FEMALE = "female"
+    OTHER = "other"
+
 class TargetingConfig(BaseModel):
-    country_codes: list[str]  # ISO 3166-1 alpha-2; empty = Worldwide (no filter)
+    country_codes: list[str] = []   # ISO 3166-1 alpha-2; empty = Worldwide
+    languages: list[str] = []       # ISO 639-1; empty = all languages
+    age_groups: list[AgeGroup] = [] # empty = all ages
+    genders: list[Gender] = []      # empty = all genders
 ```
 
-When `country_codes` is non-empty, a `CountryFilter` is added to the Rapidata order. Worldwide = no `CountryFilter` applied. No language filter is ever applied — surveys go out to respondents of any language.
+**Default is all-empty (Worldwide / all demographics).** Demographic filters narrow the respondent pool significantly and slow response collection. The agent should only populate fields that were explicitly stated or strongly implied by the user.
 
-The frontend `TargetingSelector` component exposes countries grouped by continent. The selection is passed to `POST /research/stream` as repeated `country_codes` query parameters (e.g. `?country_codes=US&country_codes=DE`). The API builds a `TargetingConfig` and threads it through `run_agent` → `_dispatch` → each tool call.
+`_filters()` in `tools.py` maps `TargetingConfig` → Rapidata filter objects:
+- Single age group → `AgeFilter([ag])`; multiple → `OrFilter([AgeFilter([ag]) for ag in ages])`
+- Single gender → `GenderFilter([g])`; multiple → `OrFilter([GenderFilter([g]) for g in genders])`
+- Languages → `LanguageFilter(normalized_codes)`
+- Countries → `CountryFilter(codes)`
+
+The agent has an `update_targeting` tool it can call to set/change targeting. On call:
+1. `TargetingUpdateEvent` is emitted over SSE (frontend updates `currentTargeting` in Zustand)
+2. An `agent_thought` bubble confirms the change
+3. Subsequent `_dispatch` calls use the updated `TargetingConfig`
+
+The frontend `DemographicBar` component replaces the old `TargetingSelector`. It shows the current targeting as compact pills (one per dimension: country, language, age, gender). Default state renders as "🌍 Worldwide · 🗣 All languages · 👤 All ages · ⚥ All genders" — not blank.
+
+`POST /research/stream` body now accepts `targeting: TargetingConfig` (JSON, replaces old `country_codes` query params). The API threads it through `run_agent` → `_dispatch` → each tool call.
 
 ## Web Research Agent
 
@@ -135,6 +164,7 @@ When `messages` is non-empty (continuation session) the system prompt switches t
 |---|---|
 | `clarifying_question` | `session_id`, `question_index`, `question`, `options` (always 4) |
 | `agent_thought` | `text` |
+| `targeting_update` | `country_codes`, `languages`, `age_groups`, `genders` |
 | `order_dispatched` | `order_id`, `tool`, `question` |
 | `order_progress` | `order_id`, `status`, `is_complete` |
 | `order_complete` | `order_id`, `distribution`, `winner`, `n_responses` |
@@ -206,6 +236,7 @@ type ChatMessage =
 
 | SSE event | Store effect |
 |---|---|
+| `targeting_update` | update `currentTargeting` in store |
 | `clarifying_question` | push `ClarifyingQuestion` message |
 | `agent_thought` | push `AgentThought` message |
 | `order_dispatched` | add to `orders` Map **and** push `SurveyResult` message (`is_complete: false`) |

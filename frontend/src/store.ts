@@ -10,8 +10,10 @@ import type {
   SessionSummary,
   SSEEvent,
   SurveyResult,
+  TargetingConfig,
   UserMessage,
 } from "./types";
+import { emptyTargeting } from "./types";
 
 // ─── State shape ──────────────────────────────────────────────────────────────
 
@@ -33,6 +35,7 @@ export interface ResearchStore {
   sections: BriefSection[];
   brief: ResearchBrief | null;
   isPdfPanelOpen: boolean;
+  currentTargeting: TargetingConfig;
 
   _abortController: AbortController | null;
 
@@ -46,7 +49,8 @@ export interface ResearchStore {
 
   // ─── Actions ──────────────────────────────────────────────────────────────
 
-  startResearch: (question: string, countryCodes?: string[]) => void;
+  startResearch: (question: string, targeting?: TargetingConfig) => void;
+  setTargeting: (targeting: TargetingConfig) => void;
   compileFindings: () => void;
   stopResearch: () => void;
   submitAnswer: (questionIndex: number, answer: string) => void;
@@ -172,6 +176,7 @@ const INITIAL_STATE = {
   sections: [] as BriefSection[],
   brief: null as ResearchBrief | null,
   isPdfPanelOpen: false,
+  currentTargeting: emptyTargeting() as TargetingConfig,
   _abortController: null as AbortController | null,
 };
 
@@ -402,7 +407,7 @@ export const useStore = create<ResearchStore>((set, get) => ({
 
   // ─── startResearch ──────────────────────────────────────────────────────────
 
-  startResearch: (question, countryCodes = []) => {
+  startResearch: (question, targeting) => {
     get()._abortController?.abort();
     const controller = new AbortController();
     const sessionId = crypto.randomUUID();
@@ -415,7 +420,8 @@ export const useStore = create<ResearchStore>((set, get) => ({
     };
 
     // Snapshot persisted state before the set() call
-    const { conversationHistory, chatMessages: prevMessages, authToken } = get();
+    const { conversationHistory, chatMessages: prevMessages, authToken, currentTargeting } = get();
+    const effectiveTargeting = targeting ?? currentTargeting;
 
     set({
       _abortController: controller,
@@ -432,18 +438,14 @@ export const useStore = create<ResearchStore>((set, get) => ({
       brief: null,
       isPdfPanelOpen: false,
       conversationHistory,
+      currentTargeting: emptyTargeting(),
     });
-
-    const url = new URL("http://localhost:8000/research/stream");
-    for (const code of countryCodes) {
-      url.searchParams.append("country_codes", code);
-    }
 
     const extraHeaders: Record<string, string> = authToken ? { Authorization: `Bearer ${authToken}` } : {};
 
     streamSSE(
-      url.toString(),
-      { question, session_id: sessionId, messages: conversationHistory },
+      "http://localhost:8000/research/stream",
+      { question, session_id: sessionId, messages: conversationHistory, targeting: effectiveTargeting },
       controller.signal,
       extraHeaders,
       (evt) => get()._applySSEEvent(evt),
@@ -453,6 +455,10 @@ export const useStore = create<ResearchStore>((set, get) => ({
       set((s) => ({ isStreaming: s.isDone ? false : s.isStreaming && false }));
     });
   },
+
+  // ─── setTargeting ────────────────────────────────────────────────────────────
+
+  setTargeting: (targeting) => set({ currentTargeting: targeting }),
 
   // ─── compileFindings ────────────────────────────────────────────────────────
 
@@ -543,6 +549,7 @@ export const useStore = create<ResearchStore>((set, get) => ({
     set((s) => ({
       ...INITIAL_STATE,
       conversationHistory: [],
+      currentTargeting: emptyTargeting(),
       // Preserve auth and session history across resets
       authToken: s.authToken,
       sessionHistory: s.sessionHistory,
@@ -553,6 +560,18 @@ export const useStore = create<ResearchStore>((set, get) => ({
   // ─── _applySSEEvent ─────────────────────────────────────────────────────────
 
   _applySSEEvent: (evt) => {
+    if (evt.event === "targeting_update") {
+      set({
+        currentTargeting: {
+          country_codes: evt.country_codes,
+          languages: evt.languages,
+          age_groups: evt.age_groups,
+          genders: evt.genders,
+        },
+      });
+      return;
+    }
+
     if (evt.event === "clarifying_question") {
       const msg: ClarifyingQuestion = {
         id: crypto.randomUUID(),

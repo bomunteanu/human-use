@@ -1,12 +1,13 @@
 import { useRef } from "react";
 import { Button } from "@/components/ui/button";
-import { TargetingSelector } from "./TargetingSelector";
+import { DemographicBar } from "./DemographicBar";
+import type { TargetingConfig } from "../types";
 
 interface Props {
   value: string;
   onChange: (v: string) => void;
-  countryCodes: string[];
-  onCountryCodesChange: (codes: string[]) => void;
+  targeting: TargetingConfig;
+  onTargetingChange: (targeting: TargetingConfig) => void;
   onSubmit: () => void;
   onStop: () => void;
   onCompileFindings: () => void;
@@ -19,8 +20,8 @@ interface Props {
 export function ChatInputBar({
   value,
   onChange,
-  countryCodes,
-  onCountryCodesChange,
+  targeting,
+  onTargetingChange,
   onSubmit,
   onStop,
   onCompileFindings,
@@ -41,12 +42,12 @@ export function ChatInputBar({
   return (
     <div className="px-4 py-3 border-t border-[#21262d] bg-[#0d1117]">
       <div className="max-w-3xl mx-auto space-y-2">
-        {/* Audience row */}
+        {/* Demographic targeting bar */}
         <div className="flex items-center gap-2">
-          <span className="text-[11px] text-[#7d8590]">Audience:</span>
-          <TargetingSelector
-            value={countryCodes}
-            onChange={onCountryCodesChange}
+          <span className="text-[11px] text-[#7d8590] flex-shrink-0">Audience:</span>
+          <DemographicBar
+            targeting={targeting}
+            onChange={onTargetingChange}
             disabled={isStreaming}
           />
         </div>
