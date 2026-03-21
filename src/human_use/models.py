@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class FreeTextResult(BaseModel):
@@ -52,3 +52,67 @@ class ProgressResult(BaseModel):
 
 
 Result = FreeTextResult | MultipleChoiceResult | CompareResult | RankResult
+
+
+# ---------------------------------------------------------------------------
+# SSE event models
+# ---------------------------------------------------------------------------
+
+
+class AgentThoughtEvent(BaseModel):
+    event: Literal["agent_thought"] = "agent_thought"
+    text: str
+
+
+class OrderDispatchedEvent(BaseModel):
+    event: Literal["order_dispatched"] = "order_dispatched"
+    order_id: str
+    tool: str
+    question: str
+
+
+class OrderProgressEvent(BaseModel):
+    event: Literal["order_progress"] = "order_progress"
+    order_id: str
+    status: str
+    is_complete: bool
+
+
+class OrderCompleteEvent(BaseModel):
+    event: Literal["order_complete"] = "order_complete"
+    order_id: str
+    distribution: dict[str, int] | None = None
+    winner: str | None = None
+    n_responses: int
+
+
+class BriefSection(BaseModel):
+    title: str
+    content: str
+
+
+class BriefUpdateEvent(BaseModel):
+    event: Literal["brief_update"] = "brief_update"
+    section: BriefSection
+
+
+class ResearchBrief(BaseModel):
+    question: str
+    sections: list[BriefSection]
+    summary: str
+
+
+class DoneEvent(BaseModel):
+    event: Literal["done"] = "done"
+    brief: ResearchBrief
+
+
+SSEEvent = Annotated[
+    AgentThoughtEvent
+    | OrderDispatchedEvent
+    | OrderProgressEvent
+    | OrderCompleteEvent
+    | BriefUpdateEvent
+    | DoneEvent,
+    Field(discriminator="event"),
+]
